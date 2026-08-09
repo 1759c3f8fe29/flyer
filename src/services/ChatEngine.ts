@@ -11,8 +11,12 @@ import type {
 } from '@/src/config/types';
 import {
   Paths,
+  cancelOnDisconnect,
   fanOut,
   increment,
+  isPermissionDenied,
+  keepSynced,
+  onDisconnectRemove,
   onValue,
   pushKey,
   readOnce,
@@ -132,6 +136,10 @@ export function listenToChats(uid: string): Unsubscribe {
   const flags = new Map<string, UserChatFlags>();
   const latest = new Map<string, Record<string, unknown>>();
 
+  // Survives this listener's lifetime in the disk cache, so the next cold start
+  // paints the last known chat list instead of an empty screen while offline.
+  const releaseSync = keepSynced(Paths.userChats(uid));
+
   const emit = (chatId: string) => {
     const raw = latest.get(chatId);
     if (!raw) return;
@@ -182,6 +190,7 @@ export function listenToChats(uid: string): Unsubscribe {
 
   return () => {
     offIndex();
+    releaseSync();
     for (const off of perChat.values()) off();
     perChat.clear();
     flags.clear();
@@ -302,22 +311,49 @@ export function listenToBlocks(uid: string): Unsubscribe {
 
 // --- chat lifecycle ------------------------------------------------------
 
-/** Idempotent: safe to call every time a chat is opened. */
+/**
+ * Idempotent: safe to call every time a chat is opened.
+ *
+ * The existence probe has to tolerate a permission error. `chats/{chatId}` is
+ * readable only by a participant, and that rule is evaluated against the data
+ * at the path — so for a chat that does not exist there is no participant list
+ * to match against and the read is *denied* rather than returning null. Letting
+ * that propagate meant the first-ever chat with anyone failed with "Could not
+ * open chat", and only opening it a second time worked... except the first
+ * attempt never created it, so it never did.
+ *
+ * A denial and a null are therefore the same answer here: nothing readable is
+ * there, so try to create it. If it does exist and someone else created it
+ * first, the create write is refused by `!data.exists()` and that refusal is
+ * swallowed — by then the chat is present, which is all the caller wanted.
+ */
 export async function ensureChat(myUid: string, peerUid: string): Promise<string> {
   const chatId = chatIdFor(myUid, peerUid);
-  const existing = await readOnce<ChatSummary>(Paths.chat(chatId));
+
+  let existing: ChatSummary | null = null;
+  try {
+    existing = await readOnce<ChatSummary>(Paths.chat(chatId));
+  } catch (e) {
+    if (!isPermissionDenied(e)) throw e;
+  }
 
   if (!existing) {
-    await fanOut({
-      [Paths.chat(chatId)]: {
-        participants: { [myUid]: true, [peerUid]: true },
-        lastMessage: null,
-        lastTimestamp: serverTimestamp(),
-        unread: { [myUid]: 0, [peerUid]: 0 },
-      },
-      [Paths.userChat(myUid, chatId)]: { lastTimestamp: serverTimestamp() },
-      [Paths.userChat(peerUid, chatId)]: { lastTimestamp: serverTimestamp() },
-    });
+    try {
+      await fanOut({
+        [Paths.chat(chatId)]: {
+          participants: { [myUid]: true, [peerUid]: true },
+          lastMessage: null,
+          lastTimestamp: serverTimestamp(),
+          unread: { [myUid]: 0, [peerUid]: 0 },
+        },
+        [Paths.userChat(myUid, chatId)]: { lastTimestamp: serverTimestamp() },
+        [Paths.userChat(peerUid, chatId)]: { lastTimestamp: serverTimestamp() },
+      });
+    } catch (e) {
+      // Lost a race with the peer opening the same chat, or with our own
+      // double-tap. Either way the chat now exists, which is the postcondition.
+      if (!isPermissionDenied(e)) throw e;
+    }
   }
 
   return chatId;
@@ -759,6 +795,16 @@ export function setTyping(chatId: string, uid: string): void {
   const key = `${chatId}:${uid}`;
   write(Paths.typingUser(chatId, uid), Date.now()).catch(() => {});
 
+  /**
+   * The server clears the flag if this client dies.
+   *
+   * `clearTyping` runs on a timer, and a process that is killed mid-keystroke —
+   * force-stop, crash, battery pull — never gets to run it. The node then stays
+   * set forever and the peer sees a permanent "typing…". Registering the removal
+   * with the server means the disconnect itself clears it.
+   */
+  onDisconnectRemove(Paths.typingUser(chatId, uid)).catch(() => {});
+
   const existing = typingTimers.get(key);
   if (existing) clearTimeout(existing);
 
@@ -778,7 +824,23 @@ export async function clearTyping(chatId: string, uid: string): Promise<void> {
     clearTimeout(existing);
     typingTimers.delete(key);
   }
+  // Cancel first: leaving it armed would re-remove a node the *next* session may
+  // legitimately own, since onDisconnect registrations outlive the write itself.
+  await cancelOnDisconnect(Paths.typingUser(chatId, uid)).catch(() => {});
   await remove(Paths.typingUser(chatId, uid)).catch(() => {});
+}
+
+/**
+ * Session teardown for this module's timers.
+ *
+ * `typingTimers` is module-level, so it outlives a sign-out. A pending timer
+ * would fire under the next account and write to `typing/{chatId}/{previousUid}`
+ * — a path the new session cannot write, so it fails, but it also means the old
+ * user is left mid-typing in a chat the device is no longer signed into.
+ */
+export function stopTypingTimers(): void {
+  for (const timer of typingTimers.values()) clearTimeout(timer);
+  typingTimers.clear();
 }
 
 // --- starred / forward / mute / block ------------------------------------
@@ -888,22 +950,53 @@ export async function clearChat(chatId: string, uid: string): Promise<void> {
   appState.get().setMessages(chatId, []);
 }
 
+/**
+ * Block, in both halves: the private list that drives my own UI, and the
+ * pair-keyed mirror the message write rule actually enforces against.
+ *
+ * One fan-out, so the enforcement mirror can never disagree with the list. The
+ * mirror is keyed by chat id and stores only *who* set it, never who it points
+ * at — which is what lets both parties read it without the blocked side learning
+ * they were blocked rather than the reverse.
+ */
 export async function blockUser(myUid: string, otherUid: string): Promise<void> {
-  await write(Paths.block(myUid, otherUid), true);
+  const chatId = chatIdFor(myUid, otherUid);
+  await fanOut({
+    [Paths.block(myUid, otherUid)]: true,
+    [Paths.blockPair(chatId, myUid)]: true,
+  });
 }
 
 export async function unblockUser(myUid: string, otherUid: string): Promise<void> {
-  await remove(Paths.block(myUid, otherUid));
+  const chatId = chatIdFor(myUid, otherUid);
+  await fanOut({
+    [Paths.block(myUid, otherUid)]: null,
+    [Paths.blockPair(chatId, myUid)]: null,
+  });
 }
 
-export async function isBlockedByPeer(myUid: string, peerUid: string): Promise<boolean> {
-  // Rules deny this read (blocks are private), so treat a rejection as "not
-  // blocked" and let the send fail loudly instead of guessing.
-  try {
-    return (await readOnce<boolean>(Paths.block(peerUid, myUid))) === true;
-  } catch {
-    return false;
-  }
+/**
+ * Live "is this conversation blocked, in either direction".
+ *
+ * Replaces an `isBlockedByPeer` that read the peer's private block list, was
+ * denied every time, caught the denial and returned `false` — a check that
+ * always reported "not blocked" while callers treated it as authoritative.
+ *
+ * `blockPairs/{chatId}` is readable by both participants, so this is a real
+ * answer rather than a guess. It deliberately does not distinguish direction:
+ * the caller pairs it with `blocked[peerUid]` from the store (my own list, which
+ * only I can read) to tell "I blocked them" from "they blocked me".
+ */
+export function listenToBlockPair(
+  chatId: string,
+  cb: (blockedEitherWay: boolean) => void
+): Unsubscribe {
+  return onValue(
+    Paths.blockPairs(chatId),
+    (snap) => cb(snap.exists()),
+    // A denial here means this is not a 1:1 chat I am part of; nothing to report.
+    () => cb(false)
+  );
 }
 
 export async function reportUser(
@@ -930,14 +1023,10 @@ export async function deleteChatForMe(chatId: string, uid: string): Promise<void
 
 // --- contacts / search ---------------------------------------------------
 
-export async function fetchAllUsers(myUid: string): Promise<UserProfile[]> {
-  const snap = await ref(Paths.users()).once('value');
-  const raw = (snap.val() as Record<string, UserProfile> | null) ?? {};
-  return Object.entries(raw)
-    .filter(([uid]) => uid !== myUid)
-    .map(([uid, value]) => ({ ...value, uid }))
-    .sort((a, b) => (a.name ?? '').localeCompare(b.name ?? ''));
-}
+// `fetchAllUsers` used to sit here and download the entire `users` node. It had
+// no callers, and the rules no longer grant the parent read it needed. Finding
+// strangers is DirectoryService.searchDirectory; `searchChats` below is a local
+// filter over chats you are already in and reads nothing.
 
 export function searchChats(
   chats: ChatSummary[],

@@ -129,6 +129,13 @@ export const Paths = {
 
   blocks: (uid: string) => `blocks/${uid}`,
   block: (uid: string, otherUid: string) => `blocks/${uid}/${otherUid}`,
+
+  // Enforcement mirror for 1:1 blocking. `blocks` is owner-only, so the message
+  // write rule cannot consult it; this node is keyed by chat id and readable by
+  // both participants. See the `blockPairs` comment in database.rules.json.
+  blockPairs: (chatId: string) => `blockPairs/${chatId}`,
+  blockPair: (chatId: string, uid: string) => `blockPairs/${chatId}/${uid}`,
+
   reports: () => 'reports',
 
   call: (callId: string) => `calls/${callId}`,
@@ -262,6 +269,61 @@ export async function readOnce<T = unknown>(path: string): Promise<T | null> {
   return (snap.val() as T) ?? null;
 }
 
+/**
+ * Keep a path warm in the disk cache whether or not anything is listening.
+ *
+ * `setPersistenceEnabled(true)` caches what the app *has already read this
+ * install*, which is not the same as having data on a cold start: the cache is
+ * populated by live listeners, so the very first frame after launch has nothing
+ * to draw until the socket connects. Launch on a plane and the chat list is
+ * empty rather than stale — which reads as data loss, not as offline.
+ *
+ * Marking the chat-list index synced makes the SDK persist and restore it
+ * across launches independently of listener lifetime. Deliberately narrow: a
+ * synced path is refetched in the background forever, so this is worth it for
+ * the one node that gates first paint and not for message history, which is
+ * unbounded and already paged.
+ *
+ * Returns a release function. Idempotent, and safe to call before sign-in
+ * completes — the path just stays empty.
+ */
+export function keepSynced(path: string): Unsubscribe {
+  const r = ref(path);
+  try {
+    void r.keepSynced(true);
+  } catch (e) {
+    // Non-fatal: without it the list is merely empty until the socket connects,
+    // which is the behaviour we had before.
+    console.warn('[Flyer/db] keepSynced failed', path, e);
+  }
+  return () => {
+    try {
+      void r.keepSynced(false);
+    } catch {
+      // Signing out while offline; nothing to release.
+    }
+  };
+}
+
+/**
+ * True if the database rejected this operation on rules grounds.
+ *
+ * Worth having in one place because RTDB reports a rules rejection as an
+ * untyped error with the reason only in `code`/`message`, and the distinction
+ * matters constantly: a denied *read* is frequently the normal case rather than
+ * a fault. Read rules are evaluated against the data at the path, so a rule like
+ * `data.child('participants').child(auth.uid).exists()` denies a path that does
+ * not exist yet — an "is this here?" probe on a node you cannot see until you are
+ * already in it comes back as a denial, not as null. Callers use this to tell
+ * "not there" from "genuinely not allowed" instead of surfacing every absence as
+ * a failure.
+ */
+export function isPermissionDenied(e: unknown): boolean {
+  const code = (e as { code?: string })?.code ?? '';
+  const message = (e as { message?: string })?.message ?? '';
+  return /permission[-_ ]denied/i.test(`${code} ${message}`);
+}
+
 export async function write(path: string, value: unknown): Promise<void> {
   await ref(path).set(value);
 }
@@ -297,6 +359,16 @@ export async function increment(path: string, by: number): Promise<number> {
  */
 export function onDisconnectSet(path: string, value: unknown) {
   return ref(path).onDisconnect().set(value);
+}
+
+/**
+ * Delete a path if this client disconnects uncleanly. The counterpart to
+ * `onDisconnectSet` for nodes whose absence is the resting state — a typing
+ * flag, for instance, where writing `false` would be a value the readers would
+ * then have to filter out.
+ */
+export function onDisconnectRemove(path: string) {
+  return ref(path).onDisconnect().remove();
 }
 
 export function cancelOnDisconnect(path: string) {

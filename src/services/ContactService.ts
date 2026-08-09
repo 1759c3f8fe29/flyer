@@ -1,6 +1,7 @@
 import {
   Paths,
   fanOut,
+  isPermissionDenied,
   onValue,
   readOnce,
   ref,
@@ -9,7 +10,7 @@ import {
   type Unsubscribe,
 } from './FirebaseService';
 import { appState } from './StateManager';
-import type { Contact, ContactRequest, UserProfile } from '../config/types';
+import type { Contact, ContactRequest } from '../config/types';
 
 /**
  * ContactService — the contact list and the request handshake that gates it.
@@ -29,31 +30,9 @@ import type { Contact, ContactRequest, UserProfile } from '../config/types';
 
 // --- reads ----------------------------------------------------------------
 
-/**
- * Look someone up by their exact email.
- *
- * `users` is indexed on email (see database.rules.json) so this is a server-side
- * query, not a full scan. Exact match only: prefix search over emails would let
- * anyone enumerate the user table one letter at a time.
- */
-export async function findUserByEmail(
-  email: string,
-  myUid: string
-): Promise<UserProfile | null> {
-  const needle = email.trim().toLowerCase();
-  if (!needle) return null;
-
-  const snap = await ref(Paths.users())
-    .orderByChild('email')
-    .equalTo(needle)
-    .once('value');
-
-  const raw = (snap.val() as Record<string, UserProfile> | null) ?? {};
-  const [uid, value] = Object.entries(raw)[0] ?? [];
-  if (!uid || !value || uid === myUid) return null;
-
-  return { ...value, uid };
-}
+// Looking someone up by email or handle lives in DirectoryService now: the
+// `users` rules no longer grant read on the parent node, so the query it needed
+// cannot run from a client. See the comment there.
 
 export function listenToContacts(uid: string): Unsubscribe {
   return onValue(ref(Paths.contacts(uid)), (snap) => {
@@ -126,28 +105,46 @@ export class ContactError extends Error {}
 export async function sendRequest(myUid: string, toUid: string): Promise<'sent' | 'accepted'> {
   if (myUid === toUid) throw new ContactError('You cannot add yourself.');
 
-  const [alreadyContact, theirPending, blockedByMe, blockedByThem] = await Promise.all([
+  /**
+   * Only paths this client is allowed to read are pre-checked.
+   *
+   * `blocks/{them}/{me}` used to be read here too, and it made every single
+   * request fail. The rules scope `blocks/$uid` to `.read: auth.uid === $uid`,
+   * so reading the *other* person's block list is denied — `readOnce` rejects,
+   * `Promise.all` rejects with it, and the caller reports "Could not send
+   * request" no matter who was being added or whether anyone had blocked anyone.
+   *
+   * The check was redundant as well as impossible: the write rule on
+   * contactRequests/$uid/$fromUid already refuses the create when either
+   * direction of `blocks` exists. So the server enforces it, and the failed
+   * write below is mapped to the same deliberately vague message — telling the
+   * sender they have been blocked is exactly what blocking withholds.
+   */
+  const [alreadyContact, theirPending, blockedByMe] = await Promise.all([
     isContact(myUid, toUid),
     readOnce(Paths.request(myUid, toUid)),
-    readOnce(`blocks/${myUid}/${toUid}`),
-    readOnce(`blocks/${toUid}/${myUid}`),
+    readOnce(Paths.block(myUid, toUid)),
   ]);
 
   if (alreadyContact) throw new ContactError('They are already in your contacts.');
   if (blockedByMe) throw new ContactError('Unblock them before sending a request.');
-  // Deliberately the same message as a failed send: telling the sender they
-  // have been blocked is exactly what blocking is meant to withhold.
-  if (blockedByThem) throw new ContactError('Could not send the request.');
 
   if (theirPending) {
     await acceptRequest(myUid, toUid);
     return 'accepted';
   }
 
-  await fanOut({
-    [Paths.request(toUid, myUid)]: { uid: myUid, createdAt: serverTimestamp() },
-    [Paths.sentRequest(myUid, toUid)]: { uid: toUid, createdAt: serverTimestamp() },
-  });
+  try {
+    await fanOut({
+      [Paths.request(toUid, myUid)]: { uid: myUid, createdAt: serverTimestamp() },
+      [Paths.sentRequest(myUid, toUid)]: { uid: toUid, createdAt: serverTimestamp() },
+    });
+  } catch (e) {
+    // A rules rejection here means they blocked you, or a request already
+    // exists. Neither is worth distinguishing to the sender.
+    if (isPermissionDenied(e)) throw new ContactError('Could not send the request.');
+    throw e;
+  }
   return 'sent';
 }
 

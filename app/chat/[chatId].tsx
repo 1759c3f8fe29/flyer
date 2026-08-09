@@ -46,8 +46,8 @@ import {
   deleteMessageForMe,
   dropQueued,
   editMessage,
-  isBlockedByPeer,
   isChatMuted,
+  listenToBlockPair,
   listenToBlocks,
   listenToMessages,
   listenToStarred,
@@ -137,7 +137,7 @@ export default function ChatScreen() {
   const theme = useTheme();
   const router = useRouter();
   const insets = useSafeAreaInsets();
-  const { chatId } = useLocalSearchParams<{ chatId: string }>();
+  const { chatId, jumpTo } = useLocalSearchParams<{ chatId: string; jumpTo?: string }>();
 
   const myUid = useAppStore((s) => s.currentUser?.uid) ?? null;
   const chat = useAppStore((s) => (chatId ? s.chats[chatId] : undefined));
@@ -186,7 +186,12 @@ export default function ChatScreen() {
   const [menuOpen, setMenuOpen] = useState(false);
   const [muteOpen, setMuteOpen] = useState(false);
   const [reportOpen, setReportOpen] = useState(false);
-  const [peerBlockedMe, setPeerBlockedMe] = useState(false);
+  /**
+   * True when either side of this 1:1 has blocked the other. Read from
+   * `blockPairs`, which is deliberately direction-blind; subtracting my own
+   * block below is what turns it into "they blocked me".
+   */
+  const [pairBlocked, setPairBlocked] = useState(false);
   /** Long-press selection. Empty set means normal mode. */
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
   /**
@@ -223,6 +228,9 @@ export default function ChatScreen() {
   indexRef.current = indexById;
 
   const iBlockedPeer = peerUid ? blockedMap[peerUid] === true : false;
+  // The mirror is set if *either* of us blocked; I can see my own list, so
+  // anything left over must be theirs.
+  const peerBlockedMe = pairBlocked && !iBlockedPeer;
   const muted = isChatMuted(chat, myUid ?? '');
 
   // Only meaningful on the jump-to-latest badge: while the chat is open the
@@ -304,24 +312,20 @@ export default function ChatScreen() {
     loadingRef.current = false;
   }, [chatId]);
 
-  // Blocks are private, so this read is rejected for anyone but the owner and
-  // resolves false; treat it as a best-effort hint rather than a guarantee.
+  /**
+   * Block state for this conversation, live.
+   *
+   * A listener rather than a one-shot read: being blocked mid-conversation has
+   * to disable the composer without a reopen, and unblocking has to re-enable it
+   * the same way. Groups skip it — `blockPairs` only covers 1:1 chats.
+   */
   useEffect(() => {
-    if (!myUid || !peerUid) return;
-    let alive = true;
-
-    isBlockedByPeer(myUid, peerUid)
-      .then((blocked) => {
-        if (alive) setPeerBlockedMe(blocked);
-      })
-      .catch(() => {
-        if (alive) setPeerBlockedMe(false);
-      });
-
-    return () => {
-      alive = false;
-    };
-  }, [myUid, peerUid]);
+    if (!chatId || isGroup) {
+      setPairBlocked(false);
+      return;
+    }
+    return listenToBlockPair(chatId, setPairBlocked);
+  }, [chatId, isGroup]);
 
   // The typing flag is a timestamp with a client-side cutoff, so nothing pushes
   // a re-render when it simply goes stale. Nudge one so "typing…" cannot stick.
@@ -484,8 +488,26 @@ export default function ChatScreen() {
     [loadOlder]
   );
 
-  // --- sending ------------------------------------------------------------
+  /**
+   * Opened with a target message — from the starred list, which knows the id but
+   * could not act on it until this param existed.
+   *
+   * Waits for the first page, because `jumpToMessage` pages *backwards* from
+   * what is loaded and there is nothing to page back from on an empty list: it
+   * would exhaust its attempts and report the message unavailable when it is
+   * simply not fetched yet. The ref guard makes this fire once per target rather
+   * than on every re-render that follows, so a jump the user has since scrolled
+   * away from does not yank them back.
+   */
+  const jumpedToRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!jumpTo || messages.length === 0) return;
+    if (jumpedToRef.current === jumpTo) return;
+    jumpedToRef.current = jumpTo;
+    void jumpToMessage(jumpTo);
+  }, [jumpTo, messages.length, jumpToMessage]);
 
+  // --- sending ------------------------------------------------------------
   const handleSendText = useCallback(
     async (text: string) => {
       // Groups have no peerUid; recipients come from the participant list.
@@ -1618,6 +1640,8 @@ export default function ChatScreen() {
 
         <View style={{ paddingBottom: insets.bottom }}>
           <Composer
+            chatId={chatId}
+            myUid={myUid}
             onSendText={(text) => void handleSendText(text)}
             onSendMedia={(media) => void handleSendMedia(media)}
             onSendVoice={(uri, durationMs) => void handleSendVoice(uri, durationMs)}

@@ -1,0 +1,102 @@
+# Every gate that has caught a real defect in this repo, run on every push.
+#
+# The order is deliberate: the cheap checks that need no services run first, and
+# the emulator — which needs Java and a downloaded jar — runs last, so a typo
+# fails in thirty seconds rather than four minutes.
+#
+# Pinned to node 20.18.0 to match the EAS builder. That is not tidiness: it
+# ships npm 10.8.2, and npm 11 rewrites package-lock.json in a way that breaks
+# `npm ci` on the builder. `check:lock` guards the committed file, but CI must
+# also avoid *becoming* the thing that rewrites it, so every install here is
+# `npm ci` (which never writes a lock) under the pinned version.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A force-push mid-run should cancel the superseded run, not race it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  app:
+    name: App — typecheck, lint, lockfile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20.18.0
+          cache: npm
+
+      # Before install, so a lock that npm would rewrite is caught as committed
+      # rather than after the fact.
+      - name: Check lockfile is npm-10 shaped
+        run: npm run check:lock
+
+      - run: npm ci
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Lint
+        run: npm run lint
+
+      # Structure only — no Java needed. The expression check lives in the rules
+      # job, which has the emulator.
+      - name: Check rules structure
+        run: npm run check:rules
+
+  functions:
+    name: Functions — lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20.18.0
+
+      - run: npm ci
+        working-directory: functions
+
+      - run: npm run lint
+        working-directory: functions
+
+  rules:
+    name: Security rules — compile and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20.18.0
+
+      # The database emulator is a JVM process.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Cache emulator jar
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/firebase/emulators
+          key: firebase-emulators-${{ runner.os }}
+
+      - run: npm ci
+        working-directory: tests/rules
+
+      # Compiles every .read/.write/.validate expression against the real rules
+      # parser. BUG-33 — a `\s` the engine does not implement — sat committed and
+      # undeployable because nothing did this.
+      - name: Compile rules expressions
+        run: npm run check:rules:full
+
+      - name: Run rules tests
+        run: npm run test:rules

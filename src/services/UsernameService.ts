@@ -1,4 +1,4 @@
-import { Paths, fanOut, readOnce, ref } from './FirebaseService';
+import { Paths, fanOut, readOnce } from './FirebaseService';
 import { appState } from './StateManager';
 import type { UserProfile } from '../config/types';
 
@@ -171,41 +171,14 @@ export async function findUserByUsername(
 }
 
 /**
- * Prefix search over handles, for the "add contact" screen.
+ * Prefix search over handles lived here, as an `orderByKey()` range over the
+ * `usernames` node. That range is a read of the parent, and the same permission
+ * enumerates every handle in the app \u2014 so the rules withdrew it and the search
+ * moved to `searchDirectory` in DirectoryService.ts.
  *
- * Safe to expose in a way that email is not: a handle is a public identifier
- * people choose in order to be findable, whereas an email address is not.
+ * `findUserByUsername` above is unaffected: resolving one handle you were given
+ * reads `usernames/{handle}` directly, which is still permitted.
  */
-export async function searchUsernames(
-  prefix: string,
-  myUid: string,
-  limit = 20
-): Promise<UserProfile[]> {
-  const q = normaliseUsername(prefix).replace(/^@/, '');
-  if (q.length < 2) return [];
-
-  const snap = await ref(Paths.usernames())
-    .orderByKey()
-    .startAt(q)
-    // \uf8ff sorts after any character that can appear in a handle, making
-    // this a prefix range rather than a full scan.
-    .endAt(`${q}\uf8ff`)
-    .limitToFirst(limit)
-    .once('value');
-
-  const raw = (snap.val() as Record<string, string> | null) ?? {};
-  const uids = Object.values(raw).filter((uid) => uid !== myUid);
-  if (uids.length === 0) return [];
-
-  const profiles = await Promise.all(
-    uids.map(async (uid) => {
-      const p = await readOnce<UserProfile>(Paths.user(uid));
-      return p ? { ...p, uid } : null;
-    })
-  );
-
-  return profiles.filter((p): p is UserProfile => p !== null);
-}
 
 /** Suggest a starting handle from a display name, e.g. "Ana Ruiz" -> "anaruiz". */
 export function suggestUsername(name: string, email: string): string {

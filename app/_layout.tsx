@@ -15,7 +15,12 @@ import * as Notifications from '@/src/services/NotificationManager';
 import { startPresence, stopPresence } from '@/src/services/PresenceManager';
 import { requestStartupPermissions } from '@/src/services/PermissionManager';
 import { CallManager } from '@/src/services/CallManager';
-import { listenToChats, listenToBlocks, listenToUser } from '@/src/services/ChatEngine';
+import {
+  listenToChats,
+  listenToBlocks,
+  listenToUser,
+  stopTypingTimers,
+} from '@/src/services/ChatEngine';
 import { listenToContacts, listenToRequests } from '@/src/services/ContactService';
 import { startOutbox, stopOutbox } from '@/src/services/OfflineQueue';
 import { hydrateSmartReply } from '@/src/services/SmartReplyService';
@@ -74,7 +79,6 @@ function RootNavigator() {
     // scope — env.ts logs missing config on import, and ChatEngine calls
     // registerSender when it is first imported (which the import above does).
     void hydrateSmartReply();
-    void Notifications.ensureChannels();
 
     let sessionTeardown: (() => void)[] = [];
     let activeUid: string | null = null;
@@ -92,6 +96,9 @@ function RootNavigator() {
       if (activeUid) {
         stopPresence();
         stopOutbox();
+        // Module-level timers in ChatEngine; without this a pending typing timer
+        // fires under whoever signs in next.
+        stopTypingTimers();
         Notifications.stop();
         CallManager.detach();
       }
@@ -133,7 +140,7 @@ function RootNavigator() {
       const offRequests = listenToRequests(user.uid);
 
       startPresence(user.uid);
-      startOutbox();
+      startOutbox(user.uid);
       CallManager.attach(user.uid);
 
       /**

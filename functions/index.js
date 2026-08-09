@@ -49,6 +49,18 @@ const STALE_CALL_MS = 60 * 1000;
 const PREVIEW_MAX = 120;
 
 /**
+ * Directory search limits.
+ *
+ * The floor matters more than the cap. A one-character prefix matches a large
+ * slice of the handle space, so repeated short queries would rebuild the user
+ * table the rules just stopped serving — a cap alone only makes that slower.
+ * Three characters is also the minimum handle length, so no handle is unfindable
+ * by its exact name.
+ */
+const SEARCH_MIN_PREFIX = 3;
+const SEARCH_MAX_RESULTS = 20;
+
+/**
  * Mistral API key for smart replies.
  *
  * A secret, not an env var, and specifically not an `EXPO_PUBLIC_*` value:
@@ -325,6 +337,11 @@ exports.onMessageWritten = onValueCreated('/messages/{chatId}/{messageId}', asyn
 
   if (!message || typeof message.senderId !== 'string') return;
   if (message.deleted === true) return;
+  // Membership changes, renames, photo swaps and admin grants all land here as
+  // ordinary message rows. Pushing them meant a 20-person group produced 19
+  // notifications reading "Members added" every time anyone edited membership.
+  // They still render in the thread; they just do not wake anybody's phone.
+  if (message.type === 'system') return;
 
   const db = getDatabase();
   const [chatSnap, senderSnap] = await Promise.all([
@@ -343,14 +360,23 @@ exports.onMessageWritten = onValueCreated('/messages/{chatId}/{messageId}', asyn
   const now = Date.now();
   const mutedBy = chat.mutedBy || {};
 
+  // In a group the sender's name alone does not say which group it came from,
+  // and someone in a dozen groups cannot tell them apart in the tray.
+  const title = chat.isGroup && chat.name ? `${senderName} @ ${chat.name}` : senderName;
+
   const recipients = Object.keys(chat.participants).filter(
     (uid) => chat.participants[uid] && uid !== message.senderId
   );
 
   await Promise.all(
     recipients.map(async (uid) => {
-      // Muted until a future timestamp — the chat is silenced, not blocked.
-      if (Number(mutedBy[uid] || 0) > now) return;
+      // A negative value is the "mute forever" sentinel the client writes (see
+      // isChatMuted in ChatEngine.ts). This used to be a bare `> now`, and since
+      // -1 is not greater than now the push went out anyway: muting a chat
+      // forever silenced the badge and the in-app banner while still delivering
+      // every single notification.
+      const until = Number(mutedBy[uid] || 0);
+      if (until < 0 || until > now) return;
 
       const [blockSnap, tokens] = await Promise.all([
         db.ref(`blocks/${uid}/${message.senderId}`).once('value'),
@@ -363,7 +389,7 @@ exports.onMessageWritten = onValueCreated('/messages/{chatId}/{messageId}', asyn
       // backgrounded or killed, and the data block still reaches JS so tapping
       // the notification can deep-link straight to the chat.
       const { sent, failed } = await sendToUser(uid, tokens, {
-        notification: { title: senderName, body: preview },
+        notification: { title, body: preview },
         data: {
           kind: 'message',
           chatId,
@@ -397,6 +423,98 @@ exports.onMessageWritten = onValueCreated('/messages/{chatId}/{messageId}', asyn
     })
   );
 });
+
+/* ------------------------------------------------------------------ *
+ * 3b. onReactionCreated
+ * ------------------------------------------------------------------ */
+
+/**
+ * Tells the author when somebody reacts to their message.
+ *
+ * Creates only. Switching an existing reaction to a different emoji is an update
+ * and clearing one is a delete; neither deserves a second buzz for something the
+ * author has already been told about once.
+ *
+ * Only the author is notified, never the whole chat. A reaction is addressed to
+ * one person in a way a message is not, and fanning it out across a group would
+ * rebuild exactly the notification storm BUG-21 removed.
+ */
+exports.onReactionCreated = onValueCreated(
+  '/messages/{chatId}/{messageId}/reactions/{reactorId}',
+  async (event) => {
+    const { chatId, messageId, reactorId } = event.params;
+    const emoji = event.data.val();
+    if (typeof emoji !== 'string' || !emoji) return;
+
+    const db = getDatabase();
+    const message = (await db.ref(`messages/${chatId}/${messageId}`).once('value')).val();
+    if (!message || typeof message.senderId !== 'string') return;
+
+    const authorId = message.senderId;
+    if (authorId === reactorId) return;
+    // Nothing left to point at, so nothing worth interrupting anyone for.
+    if (message.deleted === true) return;
+
+    const [chatSnap, reactorSnap, blockSnap, tokens] = await Promise.all([
+      db.ref(`chats/${chatId}`).once('value'),
+      db.ref(`users/${reactorId}`).once('value'),
+      db.ref(`blocks/${authorId}/${reactorId}`).once('value'),
+      readTokens(authorId),
+    ]);
+
+    if (blockSnap.val() === true) return;
+    if (!tokens.length) return;
+
+    const chat = chatSnap.val();
+    // Removed from the group since, so the message is no longer theirs to hear
+    // about.
+    if (!chat || !chat.participants || !chat.participants[authorId]) return;
+
+    // Same sentinel as onMessageWritten: a muted chat is quiet for reactions
+    // too. Only a mention is meant to break through a mute, and mentions do not
+    // exist yet (F-07).
+    const until = Number((chat.mutedBy || {})[authorId] || 0);
+    if (until < 0 || until > Date.now()) return;
+
+    const reactorName = (reactorSnap.val() || {}).name || 'Flyer user';
+    const preview = previewFor(message);
+
+    const { sent, failed } = await sendToUser(authorId, tokens, {
+      notification: {
+        title: chat.isGroup && chat.name ? `${reactorName} @ ${chat.name}` : reactorName,
+        // Quoting the message because an emoji on its own does not say which of
+        // your messages earned it. An empty preview means a media row whose
+        // previewFor returned a label, or a text message with no text.
+        body: preview ? `${emoji} to: ${preview}` : `Reacted ${emoji} to your message`,
+      },
+      data: {
+        kind: 'reaction',
+        chatId,
+        messageId,
+        senderId: reactorId,
+      },
+      android: {
+        // Normal, not high: a reaction is never worth waking a dozing device for.
+        priority: 'normal',
+        notification: {
+          channelId: 'messages',
+          // Deliberately a different tag from the chat's message notification.
+          // Sharing one would let a reaction silently replace an unread message
+          // in the tray.
+          tag: `${chatId}:reaction`,
+        },
+      },
+      apns: {
+        headers: { 'apns-priority': '5', 'apns-push-type': 'alert' },
+        payload: { aps: { 'thread-id': chatId, sound: 'default' } },
+      },
+    });
+
+    if (failed) {
+      logger.warn('Reaction push partially failed', { chatId, authorId, sent, failed });
+    }
+  }
+);
 
 /* ------------------------------------------------------------------ *
  * 4. onCallStateChanged
@@ -561,7 +679,7 @@ function parseSuggestions(text) {
       if (Array.isArray(parsed)) {
         return parsed.filter((s) => typeof s === 'string');
       }
-    } catch (e) {
+    } catch {
       // Fall through to the line-based path below.
     }
   }
@@ -614,6 +732,117 @@ async function callMistral(apiKey, turns) {
       : '';
 
   return parseSuggestions(content);
+}
+
+/* ------------------------------------------------------------------ *
+ * 7. searchUsers
+ * ------------------------------------------------------------------ */
+
+/**
+ * The only fields a stranger learns about someone they searched for.
+ *
+ * Everything omitted here is omitted on purpose. `email` is what the caller
+ * already had to know to match by email, so echoing it back to a handle search
+ * would turn the directory into an address harvester. `lastSeen`/`online` are
+ * privacy-gated presence, `about` is profile text, and neither is needed to
+ * decide whether to send a contact request.
+ */
+function searchProjection(uid, profile) {
+  const privacy = profile.privacy || {};
+  return {
+    uid,
+    name: String(profile.name || 'Flyer user'),
+    username: profile.username ? String(profile.username) : null,
+    photoURL: privacy.showPhoto === false ? null : String(profile.photoURL || '') || null,
+  };
+}
+
+/**
+ * Directory search by handle prefix or exact email.
+ *
+ * This exists because the `users` and `usernames` rules no longer grant read on
+ * the parent node, which is what made client-side search possible and also made
+ * whole-table download possible — the same permission does both. Moving it here
+ * keeps discovery working while the enumeration it used to allow stays shut.
+ *
+ * Email is matched exactly, never by prefix: a prefix match over addresses lets
+ * a caller confirm addresses they merely guessed, whereas an exact match only
+ * confirms one they already had. That asymmetry is the whole reason the two
+ * inputs are treated differently.
+ */
+exports.searchUsers = onCall(async (request) => {
+  const uid = request.auth && request.auth.uid;
+  if (!uid) throw new HttpsError('unauthenticated', 'You must be signed in to search.');
+
+  const raw = (request.data || {}).query;
+  if (typeof raw !== 'string') {
+    throw new HttpsError('invalid-argument', 'query is required.');
+  }
+
+  const q = raw.trim().toLowerCase().replace(/^@/, '');
+  if (q.length < SEARCH_MIN_PREFIX) return { results: [] };
+
+  const db = getDatabase();
+
+  // An address is unambiguous, so an email query is a lookup rather than a
+  // search: at most one row, and no handle results mixed in to pad it out.
+  if (q.includes('@')) {
+    const snap = await db
+      .ref('users')
+      .orderByChild('email')
+      .equalTo(q)
+      .limitToFirst(1)
+      .once('value');
+
+    const results = [];
+    snap.forEach((child) => {
+      if (child.key !== uid) results.push(searchProjection(child.key, child.val() || {}));
+    });
+    return { results: await withoutBlockers(db, uid, results) };
+  }
+
+  if (!/^[a-z0-9_.]+$/.test(q)) return { results: [] };
+
+  // \uf8ff sorts after any character a handle may contain, making this a prefix
+  // range rather than a scan of the whole index.
+  const claims = await db
+    .ref('usernames')
+    .orderByKey()
+    .startAt(q)
+    .endAt(`${q}\uf8ff`)
+    .limitToFirst(SEARCH_MAX_RESULTS)
+    .once('value');
+
+  const uids = [];
+  claims.forEach((child) => {
+    const owner = child.val();
+    if (typeof owner === 'string' && owner !== uid) uids.push(owner);
+  });
+  if (uids.length === 0) return { results: [] };
+
+  const rows = await Promise.all(uids.map((u) => db.ref(`users/${u}`).once('value')));
+  const results = rows
+    .map((snap, i) => (snap.exists() ? searchProjection(uids[i], snap.val() || {}) : null))
+    .filter(Boolean);
+
+  return { results: await withoutBlockers(db, uid, results) };
+});
+
+/**
+ * Drop anyone who has blocked the caller.
+ *
+ * A block is meant to be silent, so the blocked party must not be able to tell a
+ * block from a deleted account — returning the row and letting the send fail
+ * later would announce it. Reading `blocks/{peer}/{caller}` is only possible
+ * here: that subtree is owner-only to the client, and the Admin SDK bypasses
+ * rules. The caller's own blocks are left in; hiding people you blocked yourself
+ * would make them unsearchable and un-unblockable.
+ */
+async function withoutBlockers(db, uid, results) {
+  const flags = await Promise.all(
+    results.map((r) => db.ref(`blocks/${r.uid}/${uid}`).once('value'))
+  );
+  return results.filter((_, i) => flags[i].val() !== true);
 }
 
 /**

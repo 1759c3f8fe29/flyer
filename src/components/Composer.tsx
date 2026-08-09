@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { StyleSheet, Text, TextInput, View } from 'react-native';
+import { AppState, StyleSheet, Text, TextInput, View } from 'react-native';
 import type { Message, ReplyRef } from '@/src/config/types';
 import { useTheme } from '@/src/theme/ThemeProvider';
 import { Limits } from '@/src/config/env';
@@ -8,6 +8,7 @@ import {
   formatDuration,
   type PickedMedia,
 } from '@/src/services/MediaManager';
+import { clearDraft, flushDrafts, loadDraft, saveDraft } from '@/src/services/DraftService';
 import { Icon } from './Icon';
 import { Pressable } from './Pressable';
 import { RecordingDot, RecordingWaveform } from './RecordingWaveform';
@@ -15,6 +16,10 @@ import { AttachSheet } from './AttachSheet';
 import { EmojiRow } from './EmojiRow';
 
 interface Props {
+  /** Which conversation this draft belongs to. */
+  chatId: string;
+  /** Draft owner. Null before auth resolves; drafts are simply not persisted then. */
+  myUid: string | null;
   onSendText: (text: string) => void;
   onSendMedia: (media: PickedMedia[]) => void;
   onSendVoice: (uri: string, durationMs: number) => void;
@@ -37,6 +42,8 @@ interface Props {
  * send is unambiguous and survives interruption.
  */
 export function Composer({
+  chatId,
+  myUid,
   onSendText,
   onSendMedia,
   onSendVoice,
@@ -68,6 +75,56 @@ export function Composer({
     }
   }, [editing]);
 
+  /**
+   * Restore the saved draft, and put it back after an edit ends.
+   *
+   * Editing is deliberately excluded on both sides: the effect does not load
+   * while `editing` is set (the effect above owns the field then), and
+   * `persist` below refuses to write, so the message being edited never
+   * overwrites the draft it temporarily displaced. Exiting edit mode re-runs
+   * this and the untouched draft comes back.
+   *
+   * The generation guard is for the await: switching chats fast enough that the
+   * previous read resolves last would otherwise drop the old chat's text into
+   * the new one's composer.
+   */
+  const restoreGeneration = useRef(0);
+  useEffect(() => {
+    if (!myUid || editing) return;
+
+    const mine = ++restoreGeneration.current;
+    void loadDraft(myUid, chatId).then((saved) => {
+      if (mine !== restoreGeneration.current) return;
+      // Only seed an untouched field — a restore that lands after the first
+      // keystroke would delete it.
+      setText((prev) => (prev === '' ? saved : prev));
+    });
+  }, [myUid, chatId, editing]);
+
+  const persist = useCallback(
+    (value: string) => {
+      if (!myUid || editing) return;
+      saveDraft(myUid, chatId, value);
+    },
+    [myUid, chatId, editing]
+  );
+
+  /**
+   * The throttle window in DraftService is the one gap where text is only in
+   * memory, so close it at both moments the process can end: leaving the chat,
+   * and leaving the foreground (Android kills backgrounded apps without
+   * warning, and there is no unmount when it does).
+   */
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (status) => {
+      if (status !== 'active') void flushDrafts();
+    });
+    return () => {
+      sub.remove();
+      void flushDrafts();
+    };
+  }, []);
+
   useEffect(() => {
     if (replyTo) inputRef.current?.focus();
   }, [replyTo]);
@@ -83,9 +140,10 @@ export function Composer({
   const handleChange = useCallback(
     (value: string) => {
       setText(value);
+      persist(value);
       if (value.length > 0) onTyping();
     },
-    [onTyping]
+    [onTyping, persist]
   );
 
   const submit = () => {
@@ -99,6 +157,12 @@ export function Composer({
     }
     setText('');
     setEmojiOpen(false);
+
+    // Unthrottled: the text is in the thread now, and a queued write landing
+    // afterwards would resurrect it as a draft of a message already sent.
+    // Not on an edit commit — that text was never the draft, and the real one is
+    // still on disk waiting for the restore effect to bring it back.
+    if (myUid && !editing) void clearDraft(myUid, chatId);
   };
 
   const startRecording = async () => {
@@ -228,7 +292,13 @@ export function Composer({
       {emojiOpen ? (
         <EmojiRow
           onPick={(emoji) => {
-            setText((prev) => prev + emoji);
+            setText((prev) => {
+              const next = prev + emoji;
+              // Emoji arrive through the picker rather than onChangeText, so
+              // without this a message built entirely from taps saves nothing.
+              persist(next);
+              return next;
+            });
             onTyping();
           }}
         />

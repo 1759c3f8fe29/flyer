@@ -11,7 +11,6 @@ import {
 } from 'react-native';
 import { useRouter } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import type { UserProfile } from '@/src/config/types';
 import { useTheme } from '@/src/theme/ThemeProvider';
 import { Avatar } from '@/src/components/Avatar';
 import { Icon } from '@/src/components/Icon';
@@ -19,12 +18,17 @@ import { Pressable } from '@/src/components/Pressable';
 import { alertError } from '@/src/components/Confirm';
 import {
   ContactError,
-  findUserByEmail,
   relationshipWith,
   sendRequest,
   type RelationshipState,
 } from '@/src/services/ContactService';
-import { searchUsernames } from '@/src/services/UsernameService';
+import {
+  SEARCH_MIN_PREFIX,
+  findUserByEmail,
+  hitToPartial,
+  searchDirectory,
+  type SearchHit,
+} from '@/src/services/DirectoryService';
 import { useAppStore } from '@/src/services/StateManager';
 
 type Mode = 'username' | 'email';
@@ -44,7 +48,9 @@ export default function AddContactScreen() {
   const insets = useSafeAreaInsets();
 
   const myUid = useAppStore((s) => s.currentUser?.uid) ?? null;
-  const cacheUser = useAppStore((s) => s.cacheUser);
+  // Merge, not replace: a search hit is a projection, and someone you already
+  // have a chat with must not lose their cached profile by turning up in one.
+  const mergeUser = useAppStore((s) => s.mergeUser);
   // Subscribing to these keeps the button label correct the instant the
   // listener sees the request land, with no local mirror to fall out of sync.
   useAppStore((s) => s.requests);
@@ -54,7 +60,7 @@ export default function AddContactScreen() {
   const [query, setQuery] = useState('');
   const [searching, setSearching] = useState(false);
   const [sending, setSending] = useState<string | null>(null);
-  const [results, setResults] = useState<UserProfile[]>([]);
+  const [results, setResults] = useState<SearchHit[]>([]);
   const [notFound, setNotFound] = useState(false);
   // Guards against an older, slower search overwriting a newer one's results.
   const seq = useRef(0);
@@ -68,11 +74,13 @@ export default function AddContactScreen() {
     setNotFound(false);
     setResults([]);
     try {
-      const found = await findUserByEmail(needle, myUid);
+      const found = await findUserByEmail(needle);
       if (ticket !== seq.current) return;
+      // The callable filters you out of your own results, so a hit is always
+      // somebody else.
       if (found) {
         setResults([found]);
-        cacheUser(found);
+        mergeUser(hitToPartial(found));
       } else {
         setNotFound(true);
       }
@@ -82,7 +90,7 @@ export default function AddContactScreen() {
     } finally {
       if (ticket === seq.current) setSearching(false);
     }
-  }, [query, myUid, searching, cacheUser]);
+  }, [query, myUid, searching, mergeUser]);
 
   // Usernames search as you type; email waits for submit because an exact match
   // on a half-typed address is never going to hit.
@@ -90,7 +98,9 @@ export default function AddContactScreen() {
     if (mode !== 'username') return;
 
     const needle = query.trim().replace(/^@/, '').toLowerCase();
-    if (needle.length < 2 || !myUid) {
+    // The server ignores anything shorter, so asking would render "no results"
+    // for a search that never ran.
+    if (needle.length < SEARCH_MIN_PREFIX || !myUid) {
       setResults([]);
       setNotFound(false);
       setSearching(false);
@@ -101,11 +111,11 @@ export default function AddContactScreen() {
     setSearching(true);
     const timer = setTimeout(async () => {
       try {
-        const found = await searchUsernames(needle, myUid);
+        const found = await searchDirectory(needle);
         if (ticket !== seq.current) return;
         setResults(found);
         setNotFound(found.length === 0);
-        found.forEach(cacheUser);
+        found.forEach((hit) => mergeUser(hitToPartial(hit)));
       } catch (e) {
         if (ticket !== seq.current) return;
         console.warn('[Flyer/add-contact] username search failed', e);
@@ -116,10 +126,10 @@ export default function AddContactScreen() {
     }, 250);
 
     return () => clearTimeout(timer);
-  }, [query, mode, myUid, cacheUser]);
+  }, [query, mode, myUid, mergeUser]);
 
   const onSend = useCallback(
-    async (target: UserProfile) => {
+    async (target: SearchHit) => {
       if (!myUid || sending) return;
       setSending(target.uid);
       try {
@@ -202,7 +212,7 @@ export default function AddContactScreen() {
 
         <Text style={[styles.label, { color: theme.colors.textMuted }]}>
           {mode === 'username'
-            ? 'Search for someone by their @username.'
+            ? `Search for someone by their @username — at least ${SEARCH_MIN_PREFIX} characters.`
             : 'Enter the exact email address of the person you want to add.'}
         </Text>
 
@@ -285,7 +295,9 @@ export default function AddContactScreen() {
                 name={item.name ?? ''}
                 uid={item.uid}
                 size={56}
-                showPhoto={item.privacy?.showPhoto !== false}
+                // The callable withholds the photo of anyone whose privacy hides
+                // it, so a URL that arrived here is one we are allowed to show.
+                showPhoto
               />
               <View style={styles.cardText}>
                 <Text style={[styles.cardName, { color: theme.colors.text }]} numberOfLines={1}>
@@ -295,7 +307,7 @@ export default function AddContactScreen() {
                   style={[styles.cardEmail, { color: theme.colors.textMuted }]}
                   numberOfLines={1}
                 >
-                  {item.username ? `@${item.username}` : item.email}
+                  {item.username ? `@${item.username}` : (item.email ?? '')}
                 </Text>
               </View>
 

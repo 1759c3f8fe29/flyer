@@ -13,6 +13,8 @@
     "doctor": "npx expo-doctor",
     "check:lock": "node scripts/check-lock.mjs",
     "check:rules": "node scripts/check-rules.mjs",
+    "check:rules:full": "node scripts/check-rules.mjs --expressions",
+    "test:rules": "npm --prefix tests/rules test",
     "fixdeps": "npx expo install --check"
   },
   "dependencies": {

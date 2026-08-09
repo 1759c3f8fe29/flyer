@@ -136,7 +136,10 @@ export default function StarredScreen() {
   const renderItem = useCallback(
     ({ item }: { item: StarredItem }) => (
       <Pressable
-        onPress={() => router.push(`/chat/${item.chatId}`)}
+        // The message id was already here; until the chat screen accepted a
+        // target it had nowhere to go, so tapping a starred message dropped you
+        // at the bottom of the thread to find it yourself.
+        onPress={() => router.push(`/chat/${item.chatId}?jumpTo=${item.messageId}`)}
         onLongPress={() => void unstar(item)}
         accessibilityRole="button"
         accessibilityLabel={`Message from ${item.senderName}. Long press to unstar.`}

@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { useShallow } from 'zustand/react/shallow';
+import { Limits } from '@/src/config/env';
 import type {
   CallRecord,
   CallState,
@@ -87,6 +88,15 @@ interface AppState {
   setTyping: (chatId: string, map: Record<string, number>) => void;
   cacheUser: (user: UserProfile) => void;
   cacheUsers: (users: UserProfile[]) => void;
+  /**
+   * Fold partial knowledge of a user into the cache.
+   *
+   * Distinct from `cacheUser`, which replaces. A directory search returns a
+   * projection — name, handle, photo, and nothing else — so replacing with it
+   * would blank the `about` and `lastSeen` of someone you already have a chat
+   * with the moment they turn up in a search result.
+   */
+  mergeUser: (user: Partial<UserProfile> & { uid: string }) => void;
 
   setCallState: (s: CallState) => void;
   startCall: (call: ActiveCall) => void;
@@ -181,6 +191,16 @@ export const useAppStore = create<AppState>((set) => ({
       const users = { ...s.users };
       for (const u of list) users[u.uid] = u;
       return { users };
+    }),
+  mergeUser: (user) =>
+    set((s) => {
+      const existing = s.users[user.uid];
+      // Undefined means "not fetched", so it must not overwrite. An explicit
+      // null does mean "cleared" and is allowed through.
+      const patch = Object.fromEntries(
+        Object.entries(user).filter(([, v]) => v !== undefined)
+      ) as Partial<UserProfile>;
+      return { users: { ...s.users, [user.uid]: { ...existing, ...patch } as UserProfile } };
     }),
 
   setCallState: (callState) =>
@@ -278,10 +298,25 @@ export const selectTotalUnread = (s: AppState): number => {
   return Object.values(s.chats).reduce((sum, c) => sum + (c.unread?.[uid] ?? 0), 0);
 };
 
+/**
+ * How long a typing flag that was never cleared keeps showing.
+ *
+ * The writer removes the node one idle window after the last keystroke, and that
+ * removal — not this cutoff — is what normally ends the indicator. The cutoff
+ * only governs flags whose removal never ran: the app was backgrounded
+ * mid-keystroke, which suspends the clearing timer on both platforms.
+ *
+ * Derived rather than the flat 6000 it used to be. At double the idle window, a
+ * peer who backgrounded the app stayed "typing…" for twice as long as they had
+ * actually been idle. The extra second is slack for write latency, so a flag
+ * still being refreshed is never judged stale between keystrokes.
+ */
+const TYPING_STALE_MS = Limits.typingIdleMs + 1000;
+
 export const selectPeerTyping = (chatId: string, myUid: string) => (s: AppState) => {
   const map = s.typingState[chatId];
   if (!map) return false;
-  const cutoff = Date.now() - 6000;
+  const cutoff = Date.now() - TYPING_STALE_MS;
   return Object.entries(map).some(([uid, ts]) => uid !== myUid && ts > cutoff);
 };
 

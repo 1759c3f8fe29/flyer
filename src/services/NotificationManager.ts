@@ -117,7 +117,9 @@ function handleForeground(message: FirebaseMessagingTypes.RemoteMessage) {
   const data = message.data as Record<string, string> | undefined;
   if (!data) return;
 
-  if (data.kind === 'message') {
+  // Reactions banner through the same path as messages: both are "someone did
+  // something in a chat you are not looking at", and both open that chat.
+  if (data.kind === 'message' || data.kind === 'reaction') {
     const { chatId, senderId } = data;
     if (!chatId) return;
 
@@ -140,7 +142,7 @@ function handleTap(message: FirebaseMessagingTypes.RemoteMessage) {
   const data = message.data as Record<string, string> | undefined;
   if (!data || !navigate) return;
 
-  if (data.kind === 'message' && data.chatId) {
+  if ((data.kind === 'message' || data.kind === 'reaction') && data.chatId) {
     navigate(`/chat/${data.chatId}`);
   }
   if (data.kind === 'call') {
@@ -148,15 +150,11 @@ function handleTap(message: FirebaseMessagingTypes.RemoteMessage) {
   }
 }
 
-/**
- * Android notification channels. These must exist before the first notification
- * or it is dropped silently on API 26+. The `calls` channel is created with max
- * importance so the OS permits a full-screen intent.
- */
-export async function ensureChannels(): Promise<void> {
-  if (Platform.OS !== 'android') return;
-  // react-native-callkeep creates its own high-importance call channel during
-  // setup(); the message channel is created natively by RNFirebase using the
-  // channelId we send from Cloud Functions ('messages'). Nothing to do here
-  // beyond documenting the contract — kept as a hook for future channels.
-}
+// No exported ensureChannels: there is intentionally no per-call channel setup
+// in JS. RNFirebase does not create notification channels natively (a payload
+// channelId the device has never seen falls back to FCM's auto-created
+// "Miscellaneous" channel, default importance — still delivered, just not
+// tuned), and react-native-callkeep creates its own high-importance call
+// channel during setup(). A real Android channel set belongs with a designed
+// notification-tuning feature, not an empty hook. See Part 4 of
+// FLYER_MASTER_PROMPT.md, entry for ensureChannels.

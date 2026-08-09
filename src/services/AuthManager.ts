@@ -8,6 +8,7 @@ import { Env } from '@/src/config/env';
 import { DEFAULT_PRIVACY, type UserProfile } from '@/src/config/types';
 import { Paths, fanOut, readOnce, serverTimestamp, update } from './FirebaseService';
 import { claimInitialUsername, releaseUsername } from './UsernameService';
+import { clearAllDrafts } from './DraftService';
 
 /**
  * AuthManager — Google Sign-In + Email/Password.
@@ -266,5 +267,11 @@ export async function deleteAccount(uid: string): Promise<void> {
     [Paths.requests(uid)]: null,
     [Paths.sentRequests(uid)]: null,
   });
+
+  // Local unsent text outlives the server data otherwise: drafts are keyed by
+  // uid and nothing else ever removes them, so a deleted account would leave
+  // its half-written messages readable by the next person to use the device.
+  await clearAllDrafts(uid);
+
   await auth().currentUser?.delete();
 }

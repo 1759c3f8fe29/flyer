@@ -1,0 +1,14 @@
+{
+  "name": "flyer-rules-tests",
+  "private": true,
+  "type": "module",
+  "description": "Security-rules tests. Deliberately a separate package — see README.md.",
+  "scripts": {
+    "test": "PATH=\"$PWD/../../.jre/bin:$PATH\" firebase emulators:exec --only database --project flyer-rules-test --config ../../firebase.json \"node --test\""
+  },
+  "devDependencies": {
+    "@firebase/rules-unit-testing": "^5.0.0",
+    "firebase": "^12.0.0",
+    "firebase-tools": "^15.0.0"
+  }
+}

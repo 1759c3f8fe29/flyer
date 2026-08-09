@@ -4,9 +4,23 @@
     ".write": false,
 
     "users": {
-      ".read": "auth != null",
+      // No `.read` at this level, deliberately.
+      //
+      // Enumeration in RTDB is a read of the *parent*: listing children or
+      // running `orderByChild('email').equalTo(...)` requires permission here,
+      // not on the rows. This node used to grant `auth != null`, so any account —
+      // one made seconds ago — could download every user, email, about text and
+      // last-seen in a single request. Granting read per-row below means a client
+      // can only resolve a uid it already has (a chat participant, a group
+      // member, a contact request), and no query returns a row the caller could
+      // not already name.
+      //
+      // `.indexOn` stays: an index is not a permission. It makes the email
+      // lookup in the `searchUsers` callable a seek rather than a full scan, and
+      // grants nothing to a client that cannot read this node to begin with.
       ".indexOn": ["email"],
       "$uid": {
+        ".read": "auth != null",
         ".write": "auth != null && auth.uid === $uid",
         ".validate": "newData.hasChildren(['name', 'email', 'createdAt'])",
         "uid": {
@@ -21,7 +35,8 @@
           ".validate": "newData.isString() && newData.val().matches(/^[a-z0-9_.]{3,24}$/) && newData.parent().parent().parent().child('usernames').child(newData.val()).val() === $uid"
         },
         "email": {
-          ".validate": "newData.isString() && newData.val().length <= 254 && newData.val().matches(/^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$/)"
+          // An allowlist rather than the `[^@\s]` denylist this used to be, because the rules regex engine has no `\s`: it rejected the whole file at parse time, which is why nothing here could be deployed. Denylisting whitespace is not merely awkward but impossible — `\t` inside a class is read as a literal `t`, `[:space:]` as the literal letters a,c,e,p,s, and a real newline ends the regex literal, so there is no way to spell "not whitespace". The class is RFC 5322 atext, deliberately wider than any address seen in practice: this field is populated from Firebase Auth, and a rule stricter than Auth would turn a legal address into a signup that cannot complete. Empty is allowed because AuthManager writes `user.email ?? ''` — an account with no address gets an empty profile field rather than a PERMISSION_DENIED it cannot recover from.
+          ".validate": "newData.isString() && newData.val().length <= 254 && (newData.val() === '' || newData.val().matches(/^[A-Za-z0-9!#$%&'*+=?^_`{|}~.\\/-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}$/))"
         },
         "photoURL": {
           ".validate": "newData.isString() && newData.val().length <= 2048 || newData.val() === null"
@@ -51,9 +66,16 @@
     },
 
     "usernames": {
-      // handle -> uid. Readable so the app can check availability and resolve a handle to a profile. A claim may only be created if free, and only deleted by its owner — that pair is what makes handles unique without a server.
-      ".read": "auth != null",
+      // handle -> uid. A claim may only be created if free, and only deleted by its owner — that pair is what makes handles unique without a server.
+      //
+      // Read is granted per handle, not on this parent. With parent read, an
+      // `orderByKey()` range enumerates every handle in the app and maps each to
+      // a uid, and the per-uid profile reads below then reassemble the very user
+      // table the `users` rule above stopped handing out. Resolving a handle
+      // somebody gave you still works; discovering handles nobody gave you is
+      // the `searchUsers` callable in functions/index.js.
       "$handle": {
+        ".read": "auth != null",
         ".write": "auth != null && ((!data.exists() && newData.val() === auth.uid) || (data.val() === auth.uid && !newData.exists()))",
         ".validate": "newData.isString() && $handle.matches(/^[a-z0-9_.]{3,24}$/)"
       }
@@ -179,7 +201,13 @@
         ".indexOn": ["timestamp"],
 
         "$messageId": {
-          ".write": "auth != null && root.child('chats').child($chatId).child('participants').child(auth.uid).exists() && !data.exists() && newData.exists() && newData.child('senderId').val() === auth.uid",
+          // Create only, by a participant, attributed to themselves — and not
+          // into a 1:1 chat where either side has blocked the other. That last
+          // clause is what makes blocking real: it was enforced nowhere before,
+          // so a blocked user's messages were written and delivered normally.
+          // `blockPairs` is consulted rather than `blocks` because a rule may
+          // only read what the writer could read (see that node's comment).
+          ".write": "auth != null && root.child('chats').child($chatId).child('participants').child(auth.uid).exists() && !data.exists() && newData.exists() && newData.child('senderId').val() === auth.uid && !root.child('blockPairs').child($chatId).hasChildren()",
           ".validate": "newData.hasChildren(['senderId', 'type', 'timestamp'])",
 
           "senderId": {
@@ -292,11 +320,37 @@
     },
 
     "blocks": {
+      // The blocker's private list. Drives their own UI ("Unblock") and is the
+      // node Cloud Functions consults before sending a push. Deliberately not
+      // readable by the person blocked — see `blockPairs` for the half that has
+      // to be mutually visible.
       "$uid": {
         ".read": "auth != null && auth.uid === $uid",
         ".write": "auth != null && auth.uid === $uid",
         "$otherUid": {
           ".validate": "newData.val() === true && $otherUid !== auth.uid"
+        }
+      }
+    },
+
+    "blockPairs": {
+      // Enforcement mirror for 1:1 blocking, keyed by the pair's chat id.
+      //
+      // A rule cannot consult `blocks/{peer}/{me}` to reject a send, because the
+      // rule would be asking a question the sender is not allowed to ask, and
+      // making `blocks` readable to the blocked party would tell them they had
+      // been blocked — precisely what blocking withholds. Keying by chatId
+      // instead means both parties can read the node (the key names them both)
+      // while neither learns which *direction* the block runs in without also
+      // checking their own list, which only they can see.
+      //
+      // Group chats never appear here: their ids are push keys, and blocking
+      // someone does not eject them from a group you share.
+      "$chatId": {
+        ".read": "auth != null && $chatId.contains(auth.uid)",
+        "$uid": {
+          ".write": "auth != null && auth.uid === $uid && $chatId.contains(auth.uid) && $chatId.contains($uid)",
+          ".validate": "newData.val() === true"
         }
       }
     },
