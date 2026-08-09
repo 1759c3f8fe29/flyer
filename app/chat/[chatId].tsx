@@ -35,6 +35,7 @@ import {
 } from '@/src/components/MessageActionsSheet';
 import { MediaViewer } from '@/src/components/MediaViewer';
 import { SmartReplyBar } from '@/src/components/SmartReplyBar';
+import { Switch } from '@/src/components/Switch';
 import { TypingIndicator } from '@/src/components/TypingIndicator';
 import { alertError, confirm } from '@/src/components/Confirm';
 import {
@@ -70,6 +71,12 @@ import {
 import { videoThumbnail } from '@/src/services/MediaManager';
 import { formatLastSeen } from '@/src/services/PresenceManager';
 import { CallManager } from '@/src/services/CallManager';
+import {
+  isSmartReplyEnabled,
+  isSmartReplyEnabledForChat,
+  setChatOverride,
+  subscribeSmartReply,
+} from '@/src/services/SmartReplyService';
 import { appState, selectPeerTyping, useAppStore } from '@/src/services/StateManager';
 import type { PickedMedia } from '@/src/services/MediaManager';
 
@@ -1100,6 +1107,38 @@ export default function ChatScreen() {
     [chatId, myUid]
   );
 
+  /**
+   * Smart replies for this conversation, from the overflow menu.
+   *
+   * Both values come off one subscription because the service notifies on any
+   * change and the two are not independent: the global switch moving in Settings
+   * has to move this row with it. `smartReplyGlobal` is what makes the row
+   * explain itself rather than sit there inert when the master switch is off.
+   */
+  const [smartReplyGlobal, setSmartReplyGlobal] = useState(() => isSmartReplyEnabled());
+  const [smartReplyHere, setSmartReplyHere] = useState(() =>
+    chatId ? isSmartReplyEnabledForChat(chatId) : false
+  );
+
+  useEffect(() => {
+    if (!chatId) return;
+    return subscribeSmartReply(() => {
+      setSmartReplyGlobal(isSmartReplyEnabled());
+      setSmartReplyHere(isSmartReplyEnabledForChat(chatId));
+    });
+  }, [chatId]);
+
+  const onToggleSmartReply = useCallback(
+    (value: boolean) => {
+      if (!chatId) return;
+      setSmartReplyHere(value);
+      // `true` clears the override rather than storing it, so this chat keeps
+      // tracking the global setting if it is later turned off and on again.
+      void setChatOverride(chatId, value ? null : false);
+    },
+    [chatId]
+  );
+
   const toggleMute = useCallback(async () => {
     setMenuOpen(false);
     if (!chatId || !myUid) return;
@@ -1530,6 +1569,31 @@ export default function ChatScreen() {
               label={muted ? 'Unmute notifications' : 'Mute notifications'}
               onPress={() => void toggleMute()}
             />
+            {/* Stays open on tap: the point of a switch is watching it move, and
+                closing the menu would hide the only feedback there is. With the
+                master switch off the row becomes a route to Settings instead of
+                a dead control. */}
+            {smartReplyGlobal ? (
+              <MenuItem
+                label="Smart replies"
+                onPress={() => onToggleSmartReply(!smartReplyHere)}
+                right={
+                  <Switch
+                    value={smartReplyHere}
+                    onValueChange={onToggleSmartReply}
+                    accessibilityLabel={`Smart replies in ${conversationName}`}
+                  />
+                }
+              />
+            ) : (
+              <MenuItem
+                label="Smart replies: off in Settings"
+                onPress={() => {
+                  setMenuOpen(false);
+                  router.push('/settings');
+                }}
+              />
+            )}
             <MenuItem label="Clear chat" onPress={() => void handleClearChat()} />
             {/* Blocking and reporting are person-to-person. In a group the
                 equivalent action is leaving, which lives on the info screen. */}
@@ -1694,10 +1758,12 @@ function MenuItem({
   label,
   destructive,
   onPress,
+  right,
 }: {
   label: string;
   destructive?: boolean;
   onPress: () => void;
+  right?: React.ReactNode;
 }) {
   const theme = useTheme();
   return (
@@ -1705,17 +1771,19 @@ function MenuItem({
       onPress={onPress}
       accessibilityRole="button"
       accessibilityLabel={label}
-      style={styles.menuItem}
+      style={[styles.menuItem, right ? styles.menuItemWithRight : null]}
     >
       <Text
         style={[
           styles.menuItemLabel,
+          right ? styles.menuItemLabelGrow : null,
           { color: destructive ? theme.colors.danger : theme.colors.text },
         ]}
         numberOfLines={1}
       >
         {label}
       </Text>
+      {right}
     </Pressable>
   );
 }
@@ -1815,7 +1883,16 @@ const styles = StyleSheet.create({
     shadowOffset: { width: 0, height: 2 },
   },
   menuItem: { paddingHorizontal: 16, paddingVertical: 13 },
+  // A switch is taller than a line of text, so the row with one keeps the same
+  // visual height as its neighbours by trading vertical padding for the control.
+  menuItemWithRight: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    paddingVertical: 7,
+  },
   menuItemLabel: { fontSize: 15 },
+  menuItemLabelGrow: { flex: 1 },
 
   listContent: { paddingVertical: 8 },
   listContentEmpty: { flexGrow: 1, justifyContent: 'center' },

@@ -9,12 +9,14 @@ import {
 } from 'react-native';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { chatIdFor } from '@/src/config/env';
 import { DEFAULT_PRIVACY, type UserProfile } from '@/src/config/types';
 import { useTheme } from '@/src/theme/ThemeProvider';
 import { Avatar } from '@/src/components/Avatar';
 import { Icon } from '@/src/components/Icon';
 import { Pressable } from '@/src/components/Pressable';
 import { ListRow } from '@/src/components/ListRow';
+import { Switch } from '@/src/components/Switch';
 import { alertError, confirm } from '@/src/components/Confirm';
 import { Paths, readOnce } from '@/src/services/FirebaseService';
 import {
@@ -26,6 +28,12 @@ import {
 } from '@/src/services/ChatEngine';
 import { CallManager } from '@/src/services/CallManager';
 import { formatLastSeen } from '@/src/services/PresenceManager';
+import {
+  isSmartReplyEnabled,
+  isSmartReplyEnabledForChat,
+  setChatOverride,
+  subscribeSmartReply,
+} from '@/src/services/SmartReplyService';
 import { useAppStore } from '@/src/services/StateManager';
 
 const REPORT_REASONS = [
@@ -76,6 +84,43 @@ export default function UserProfileScreen() {
   const peer = cached ?? fetched;
   const isBlocked = uid ? blocked[uid] === true : false;
   const privacy = peer?.privacy ?? DEFAULT_PRIVACY;
+
+  /**
+   * Smart replies for this one conversation.
+   *
+   * The chat id is derived rather than looked up: `chatIdFor` is deterministic
+   * from the two uids, so the toggle works before the chat exists and does not
+   * need `ensureChat`'s round-trip — a preference set here is waiting for the
+   * first message rather than creating an empty chat to hold it.
+   */
+  const directChatId = myUid && uid ? chatIdFor(myUid, uid) : null;
+  const [smartReplyGlobal, setSmartReplyGlobal] = useState(() => isSmartReplyEnabled());
+  const [smartReplyHere, setSmartReplyHere] = useState(() =>
+    directChatId ? isSmartReplyEnabledForChat(directChatId) : false
+  );
+
+  useEffect(() => {
+    if (!directChatId) return;
+    // One subscription for both values: the service notifies on any change, and
+    // the global switch moving in Settings has to move this row with it.
+    return subscribeSmartReply(() => {
+      setSmartReplyGlobal(isSmartReplyEnabled());
+      setSmartReplyHere(isSmartReplyEnabledForChat(directChatId));
+    });
+  }, [directChatId]);
+
+  const onToggleSmartReply = useCallback(
+    (value: boolean) => {
+      if (!directChatId) return;
+      setSmartReplyHere(value);
+      // `true` clears the override instead of storing it: with the global switch
+      // on, "follow the default" and "explicitly on" behave identically, and not
+      // writing the entry keeps this chat tracking Settings if it is turned off
+      // and on again later.
+      void setChatOverride(directChatId, value ? null : false);
+    },
+    [directChatId]
+  );
 
   const presence = useMemo(() => {
     if (!peer) return '';
@@ -232,6 +277,28 @@ export default function UserProfileScreen() {
           <ListRow icon="phone" title="Voice call" onPress={() => void placeCall('voice')} showChevron />
           <ListRow icon="video" title="Video call" onPress={() => void placeCall('video')} showChevron />
         </View>
+
+        {directChatId ? (
+          <View style={styles.section}>
+            <ListRow
+              icon="reply"
+              title="Smart replies"
+              subtitle={
+                smartReplyGlobal
+                  ? `Suggest replies in this chat. Recent messages with ${peer.name} are sent to AI.`
+                  : 'Turn on Smart replies in Settings to use this.'
+              }
+              right={
+                <Switch
+                  value={smartReplyHere}
+                  onValueChange={onToggleSmartReply}
+                  disabled={!smartReplyGlobal}
+                  accessibilityLabel={`Smart replies with ${peer.name}`}
+                />
+              }
+            />
+          </View>
+        ) : null}
 
         <View style={styles.section}>
           <ListRow

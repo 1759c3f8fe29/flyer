@@ -15,6 +15,17 @@ import { Pressable } from './Pressable';
  */
 let activeSound: { id: string; stop: () => Promise<void> } | null = null;
 
+/**
+ * Playback speeds, cycled by tapping the pill.
+ *
+ * Module-level so a speed chosen on one note carries to the next — someone
+ * skimming a run of voice notes sets 2× once, not once per note. Deliberately
+ * session-only: a listening speed is a mood, not a preference worth a storage
+ * key, and it resetting to 1× on next launch is the behaviour people expect.
+ */
+const RATES = [1, 1.5, 2] as const;
+let preferredRate: number = RATES[0];
+
 interface Props {
   uri: string;
   durationMs: number | null;
@@ -49,6 +60,7 @@ export function AudioPlayer({ uri, durationMs, messageId, tint, trackColor, seed
   const [totalMs, setTotalMs] = useState(durationMs ?? 0);
 
   const bars = useRef(barsFor(seed)).current;
+  const [rate, setRate] = useState(preferredRate);
 
   // False from the moment cleanup runs. expo-av keeps calling the status callback
   // from native until `unloadAsync` actually completes, and `createAsync` can
@@ -118,7 +130,14 @@ export function AudioPlayer({ uri, durationMs, messageId, tint, trackColor, seed
 
         const { sound } = await Audio.Sound.createAsync(
           { uri },
-          { shouldPlay: true, progressUpdateIntervalMillis: 100 },
+          {
+            shouldPlay: true,
+            progressUpdateIntervalMillis: 100,
+            // Set at creation rather than after: applying it post-play makes the
+            // first half-second audibly shift speed.
+            rate,
+            shouldCorrectPitch: true,
+          },
           onStatus
         );
 
@@ -160,6 +179,22 @@ export function AudioPlayer({ uri, durationMs, messageId, tint, trackColor, seed
     }
   };
 
+  /**
+   * Cycles 1× → 1.5× → 2× → 1×.
+   *
+   * `shouldCorrectPitch` matters more than the speed itself: without it a voice
+   * at 2× is a chipmunk, which is unusable for the thing people actually speed
+   * up — someone talking.
+   */
+  const cycleRate = () => {
+    const next = RATES[(RATES.indexOf(rate as (typeof RATES)[number]) + 1) % RATES.length];
+    setRate(next);
+    preferredRate = next;
+    soundRef.current?.setRateAsync(next, true).catch((e) => {
+      console.warn('[Flyer/audio] rate change failed', e);
+    });
+  };
+
   const progress = totalMs > 0 ? Math.min(1, positionMs / totalMs) : 0;
   const playedBars = Math.round(progress * BAR_COUNT);
   const remaining = totalMs > 0 ? totalMs - positionMs : (durationMs ?? 0);
@@ -198,6 +233,19 @@ export function AudioPlayer({ uri, durationMs, messageId, tint, trackColor, seed
       <Text style={[styles.time, { color: theme.colors.textMuted }]}>
         {formatDuration(playing || positionMs > 0 ? remaining : (durationMs ?? 0))}
       </Text>
+
+      {/* Only once the note has been started: an untouched bubble showing a
+          speed control is clutter, and there is nothing to apply it to yet. */}
+      {playing || positionMs > 0 ? (
+        <Pressable
+          onPress={cycleRate}
+          haptic
+          accessibilityLabel={`Playback speed ${rate}×, tap to change`}
+          style={[styles.ratePill, { backgroundColor: trackColor }]}
+        >
+          <Text style={[styles.rateLabel, { color: tint }]}>{rate}×</Text>
+        </Pressable>
+      ) : null}
     </View>
   );
 }
@@ -214,4 +262,11 @@ const styles = StyleSheet.create({
   },
   bar: { flex: 1, borderRadius: 2, minWidth: 2 },
   time: { fontSize: 11, minWidth: 34, textAlign: 'right' },
+  ratePill: {
+    paddingHorizontal: 7,
+    paddingVertical: 3,
+    borderRadius: 999,
+    marginLeft: 2,
+  },
+  rateLabel: { fontSize: 11, fontWeight: '700' },
 });

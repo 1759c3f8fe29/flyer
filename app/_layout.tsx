@@ -52,18 +52,25 @@ function useAuthGate() {
   const segments = useSegments();
   const navState = useRootNavigationState();
 
+  const inAuthFlow = segments[0] === 'login';
+  // The redirect below lands an effect late — one painted frame after the router
+  // has already drawn the wrong screen. On a cold start the URL is `/`, so a
+  // signed-out user watches the empty chat list appear and vanish on the way to
+  // the login screen. This flag lets the caller cover that frame.
+  const redirecting = authReady && (currentUser ? inAuthFlow : !inAuthFlow);
+
   useEffect(() => {
     // Navigating before the router has mounted throws; wait for it.
     if (!navState?.key || !authReady) return;
-
-    const inAuthFlow = segments[0] === 'login';
 
     if (!currentUser && !inAuthFlow) {
       router.replace('/login');
     } else if (currentUser && inAuthFlow) {
       router.replace('/(tabs)');
     }
-  }, [currentUser, authReady, segments, navState?.key]);
+  }, [currentUser, authReady, inAuthFlow, navState?.key]);
+
+  return redirecting;
 }
 
 function RootNavigator() {
@@ -71,7 +78,21 @@ function RootNavigator() {
   const authReady = useAppStore((s) => s.authReady);
   const [banner, setBanner] = useState<BannerPayload | null>(null);
 
-  useAuthGate();
+  const redirecting = useAuthGate();
+
+  /**
+   * Drop the splash the moment the app can actually paint, and not before.
+   *
+   * `authReady` is the real signal: for a signed-in user it flips when the first
+   * profile snapshot lands, and for a signed-out one `reset()` sets it, so both
+   * paths converge here. Hiding from inside the auth callback instead — which is
+   * what this used to do — dismissed the splash while `authReady` was still
+   * false, and the boot spinner below got a frame of screen time on every cold
+   * start.
+   */
+  useEffect(() => {
+    if (authReady) void SplashScreen.hideAsync().catch(() => {});
+  }, [authReady]);
 
   // --- auth session ------------------------------------------------------
   useEffect(() => {
@@ -109,7 +130,6 @@ function RootNavigator() {
       if (!user) {
         teardownSession();
         appState.get().reset();
-        await SplashScreen.hideAsync().catch(() => {});
         return;
       }
 
@@ -169,8 +189,6 @@ function RootNavigator() {
         });
 
       sessionTeardown = [offMe, offChats, offBlocks, offSelf, offContacts, offRequests];
-
-      await SplashScreen.hideAsync().catch(() => {});
     });
 
     return () => {
@@ -239,6 +257,20 @@ function RootNavigator() {
           options={{ animation: 'fade', gestureEnabled: false, presentation: 'fullScreenModal' }}
         />
       </Stack>
+
+      {/* Covers the frame between "wrong screen mounted" and the gate's
+          replace() landing. An overlay rather than an early return on purpose:
+          unmounting the Stack takes the navigator with it, so
+          useRootNavigationState().key goes undefined, the gate's own
+          `if (!navState?.key) return` never clears, and the app sits here
+          forever. Background only — the window is a frame or two, and a spinner
+          that brief is the flicker it is meant to hide. */}
+      {redirecting ? (
+        <View
+          pointerEvents="none"
+          style={[StyleSheet.absoluteFill, { backgroundColor: theme.colors.bg }]}
+        />
+      ) : null}
 
       <NetworkBanner />
       <CallOverlay />

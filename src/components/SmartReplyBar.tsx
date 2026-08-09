@@ -4,8 +4,8 @@ import type { Message } from '@/src/config/types';
 import { useTheme } from '@/src/theme/ThemeProvider';
 import {
   fetchSuggestions,
-  isSmartReplyEnabled,
-  subscribeSmartReply,
+  isSmartReplyEnabledForChat,
+  subscribeSmartReplyForChat,
 } from '@/src/services/SmartReplyService';
 import { Pressable } from './Pressable';
 
@@ -28,11 +28,11 @@ const MAX_SUGGESTIONS = 3;
  */
 export function SmartReplyBar({ chatId, messages, myUid, onPick }: Props) {
   const theme = useTheme();
-  const [enabled, setEnabled] = useState(isSmartReplyEnabled);
+  const [enabled, setEnabled] = useState(() => isSmartReplyEnabledForChat(chatId));
   const [suggestions, setSuggestions] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
 
-  useEffect(() => subscribeSmartReply(setEnabled), []);
+  useEffect(() => subscribeSmartReplyForChat(chatId, setEnabled), [chatId]);
 
   const newest = messages.length > 0 ? messages[messages.length - 1] : null;
   // Only offer replies to something the peer actually said.

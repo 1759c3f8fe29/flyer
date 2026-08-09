@@ -67,7 +67,16 @@ class CallManagerImpl {
           void this.acceptFromNative(event.callId);
           break;
         case 'end':
-          void this.hangUp(this.callId === event.callId ? 'hangup' : 'rejected');
+          // Only the active call may be hung up. The OS also emits `end` for
+          // UUIDs we are no longer tracking — a ghost UI left behind by a
+          // previous process, or the native side of an invite the busy path
+          // already rejected over RTDB. Routing those into hangUp() would drop
+          // whatever call is live now, since hangUp always ends `this.callId`.
+          if (this.callId !== event.callId) {
+            CallKeep.endCall(event.callId, 'remote');
+            break;
+          }
+          void this.hangUp('hangup');
           break;
         case 'mute':
           this.setMicMuted(event.muted);

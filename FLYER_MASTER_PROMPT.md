@@ -394,6 +394,59 @@ supporting "a subset of" a dialect it does not name.
   this field's shape, and **BUG-30** proposes moving email out of the public
   profile entirely. When that lands, revisit whether this rule needs to exist.
 
+**BUG-34 · P1 · A stale native end-call event hangs up the call you are on.**
+`src/services/CallManager.ts:69` — the CallKeep `end` subscription reads
+`void this.hangUp(this.callId === event.callId ? 'hangup' : 'rejected')`. The
+ternary correctly notices that the event belongs to *a different call than the
+active one*, and then hangs up anyway: `hangUp()` takes no call id and always
+tears down `this.callId`. The id comparison only picks the label written to
+`endedReason`. Symptom: a connected call drops on its own, blamed on the network.
+Reachable two ways — the OS emitting `endCall` for a ghost UUID left over from a
+previous process (the cold-start path in `BackgroundTaskManager` displays a
+CallKeep UI that outlives the JS that created it), and the busy path at
+`CallManager.ts:218-226`, which rejects a second invite at the RTDB layer while
+its native call UI is still live and will emit `endCall` when dismissed. Root
+cause: an id mismatch is treated as a naming question rather than a routing one.
+**Fix:** in the mismatch branch, do not touch the active call — `CallKeep.endCall`
+the stale id so the OS drops that specific UI, warn, and return. Only an event
+matching `this.callId` may reach `hangUp()`.
+*Found while auditing the killed-app call path (Part 4 / task #14).*
+
+**BUG-35 · P1 · The splash hides one round-trip before the UI is ready, so every
+cold start flashes a spinner.** `app/_layout.tsx:173` — `await SplashScreen.hideAsync()`
+runs at the end of the auth callback, but the thing that makes the app renderable
+is `setAuthReady(true)`, which fires from the `onValue(Paths.user(uid))` callback
+attached 45 lines earlier and **has not fired yet**. Between the two, `RootNavigator`
+renders its `!authReady` boot spinner (`:203-209`). Symptom: splash → bare spinner
+on the theme background → app, the middle frame lasting one RTDB round-trip, longer
+on mobile data, and the POST_NOTIFICATIONS dialog can pop over it. Note the comment
+at `:45` — "Keep the native splash up until auth has resolved, so the app never
+flashes the login screen at someone who is already signed in" — the intent is right
+and the code misses it by one async hop; it flashes a spinner instead of the login
+screen. Root cause: splash dismissal is sequenced against *the auth callback
+finishing* rather than against *readiness*. **Fix:** hide the splash from an effect
+keyed on `authReady` and delete both `hideAsync()` calls from the callback. This
+covers the signed-out path for free — `reset()` sets `authReady: true`
+(`StateManager.ts:225`), so the same effect fires when there is no user.
+*Related:* **S-07** (cold start does too much before first paint) is the same area;
+this is the visible half of it.
+
+**BUG-36 · P1 · Cold start for a signed-out user flashes the empty chat list
+before the login screen.** `app/_layout.tsx:55-67` — the auth gate redirects from a
+`useEffect`, which by definition runs *after* the frame is painted. On a cold start
+the URL is `/`, so expo-router mounts and paints `(tabs)` first; only then does the
+effect call `router.replace('/login')`. Symptom: a flash of the empty chat list and
+tab bar on the way to the login screen, and the mirror-image flash of the login
+screen when a sign-in resolves while it is still the visible route. Root cause: the
+gate treats "wrong screen is showing" as something to correct next tick rather than
+something to cover this tick. **Fix:** derive a `redirecting` flag alongside the
+existing conditions and paint a plain background over the `Stack` while it is true.
+It must be an *overlay*, not an early return — unmounting the `Stack` unmounts the
+navigator, `useRootNavigationState().key` goes undefined, the gate's own
+`if (!navState?.key) return` then never clears, and the app deadlocks on the
+placeholder. Background only, no spinner: the window is one or two frames and a
+spinner that brief is itself a flicker.
+
 ---
 
 ## Part 3 — WhatsApp feature parity
