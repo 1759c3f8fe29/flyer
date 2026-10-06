@@ -78,10 +78,32 @@ function parseHits(raw: unknown, email: string | null): SearchHit[] {
  * One entry point for both, because the server decides which it is from the
  * presence of an `@`. Splitting that decision across client and server would
  * give the two a way to disagree.
+ *
+ * BUG-16/31: the callable caps results but has no per-caller rate limit, so a
+ * client hammering it can scrape the handle space (~55k 3-char queries).
+ * Server-side quotas belong with App Check; until then this floor stops the
+ * accidental case — a search-as-you-type caller firing per keystroke — from
+ * looking like an attack and from burning the invoker's quota.
  */
+let lastSearchAt = 0;
+const SEARCH_MIN_INTERVAL_MS = 800;
+// Serialises callers through one gate. The timestamp check below is
+// check-then-set on module state: two concurrent searches both read the old
+// value and both fire the callable, bypassing the throttle entirely.
+let searchGate: Promise<void> = Promise.resolve();
+
 export async function searchDirectory(query: string): Promise<SearchHit[]> {
   const q = query.trim().toLowerCase().replace(/^@/, '');
   if (q.length < SEARCH_MIN_PREFIX) return [];
+
+  const turn = searchGate.then(async () => {
+    const wait = SEARCH_MIN_INTERVAL_MS - (Date.now() - lastSearchAt);
+    if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+    lastSearchAt = Date.now();
+  });
+  // A rejection must not jam the gate for every later search.
+  searchGate = turn.catch(() => {});
+  await turn;
 
   const call = functions().httpsCallable('searchUsers');
   const response = await call({ query: q });

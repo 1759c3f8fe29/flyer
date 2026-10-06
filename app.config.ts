@@ -74,7 +74,12 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
       ITSAppUsesNonExemptEncryption: false,
     },
     entitlements: {
-      'aps-environment': 'production',
+      // Production only: dev/preview builds use the APNs sandbox, and a
+      // hardcoded `production` here breaks pushes on every non-store build.
+      // Omitted elsewhere so Expo resolves it from the provisioning profile.
+      ...(process.env.EAS_BUILD_PROFILE === 'production'
+        ? { 'aps-environment': 'production' }
+        : {}),
     },
   },
 
@@ -112,8 +117,13 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
     [
       '@react-native-google-signin/google-signin',
       {
-        // Reversed iOS OAuth client ID, e.g. com.googleusercontent.apps.1234-abcd
-        iosUrlScheme: process.env.EXPO_PUBLIC_GOOGLE_IOS_URL_SCHEME ?? 'com.googleusercontent.apps.REPLACE_ME',
+        // Reversed iOS OAuth client ID, e.g. com.googleusercontent.apps.1234-abcd.
+        // No placeholder default: a bogus scheme baked into the build fails
+        // iOS Google Sign-In opaquely. Supply the real value via EAS secrets;
+        // when absent the plugin is configured without a scheme.
+        ...(process.env.EXPO_PUBLIC_GOOGLE_IOS_URL_SCHEME
+          ? { iosUrlScheme: process.env.EXPO_PUBLIC_GOOGLE_IOS_URL_SCHEME }
+          : {}),
       },
     ],
     [

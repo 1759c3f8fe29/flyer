@@ -132,7 +132,7 @@ export default function UserProfileScreen() {
     setBusy(true);
     try {
       const chatId = await ensureChat(myUid, uid);
-      router.replace(`/chat/${chatId}`);
+      router.push(`/chat/${chatId}`);
     } catch (e) {
       console.warn('[Flyer/user] could not open chat', e);
       alertError('Could not open chat', 'Please try again.');

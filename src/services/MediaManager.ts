@@ -289,6 +289,21 @@ export class VoiceRecorder {
     onSample: (s: RecordingSample) => void,
     onAutoStop?: () => void
   ): Promise<boolean> {
+    // Re-entrant guard: a double-tap otherwise orphans the first Recording
+    // (still metering, still auto-stopping) while the handle is overwritten.
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+    if (this.recording) {
+      try {
+        await this.recording.stopAndUnloadAsync();
+      } catch {
+        /* already dead — the handle is what matters */
+      }
+      this.recording = null;
+    }
+
     const perm = await ensureCallPermissions(false);
     if (!perm.ok) return false;
 

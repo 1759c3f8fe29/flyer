@@ -46,9 +46,10 @@ export function systemLabel(
     case 'group_photo_changed':
       return `${who(event.by)} changed the group photo`;
     case 'admin_granted':
-      return `${whom(event.uid)} ${event.uid === myUid ? 'are' : 'is'} now an admin`;
+      // Subject position takes `who` ("You are…"), not `whom` ("you are…").
+      return `${who(event.uid)} ${event.uid === myUid ? 'are' : 'is'} now an admin`;
     case 'admin_revoked':
-      return `${whom(event.uid)} ${event.uid === myUid ? 'are' : 'is'} no longer an admin`;
+      return `${who(event.uid)} ${event.uid === myUid ? 'are' : 'is'} no longer an admin`;
     default:
       return '';
   }

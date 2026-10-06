@@ -302,10 +302,19 @@ export default function GroupInfoScreen() {
           { backgroundColor: theme.colors.header, paddingTop: insets.top + 8 },
         ]}
       >
-        <Pressable round={40} onPress={() => router.back()} accessibilityLabel="Go back">
-          <Icon name="back" size={30} color="#FFFFFF" />
+        <Pressable
+          round={40}
+          onPress={() => {
+            // Deep links and notification taps can land here with an empty
+            // stack, where back() is a no-op that strands the user.
+            if (router.canGoBack()) router.back();
+            else router.replace('/');
+          }}
+          accessibilityLabel="Go back"
+        >
+          <Icon name="back" size={30} color={theme.colors.headerText} />
         </Pressable>
-        <Text style={styles.headerTitle}>Group info</Text>
+        <Text style={[styles.headerTitle, { color: theme.colors.headerText }]}>Group info</Text>
       </View>
 
       <FlatList
@@ -537,11 +546,11 @@ export default function GroupInfoScreen() {
             ]}
           >
             <Pressable round={40} onPress={() => setAddOpen(false)} accessibilityLabel="Close">
-              <Icon name="close" size={26} color="#FFFFFF" />
+              <Icon name="close" size={26} color={theme.colors.headerText} />
             </Pressable>
             <View style={styles.headerText}>
-              <Text style={styles.headerTitle}>Add participants</Text>
-              <Text style={styles.headerSubtitle}>
+              <Text style={[styles.headerTitle, { color: theme.colors.headerText }]}>Add participants</Text>
+              <Text style={[styles.headerSubtitle, { color: theme.colors.headerSubtext }]}>
                 {addSelected.size === 0 ? 'Choose contacts' : `${addSelected.size} selected`}
               </Text>
             </View>
@@ -644,8 +653,8 @@ const styles = StyleSheet.create({
     paddingBottom: 10,
   },
   headerText: { flex: 1, marginLeft: 4 },
-  headerTitle: { color: '#FFFFFF', fontSize: 19, fontWeight: '600', marginLeft: 4 },
-  headerSubtitle: { color: 'rgba(255,255,255,0.75)', fontSize: 12.5, marginLeft: 4, marginTop: 1 },
+  headerTitle: { fontSize: 19, fontWeight: '600', marginLeft: 4 },
+  headerSubtitle: { fontSize: 12.5, marginLeft: 4, marginTop: 1 },
 
   hero: { alignItems: 'center', paddingTop: 28, paddingBottom: 20 },
   photoWrap: { width: 148, height: 148 },

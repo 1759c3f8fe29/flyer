@@ -86,20 +86,29 @@ export function SwipeableChatRow({ children, right, left, enabled = true }: Prop
   // driving the app with VoiceOver, TalkBack, or a switch device. Exposing them
   // as accessibility actions is the only way those users can reach them at all:
   // AT surfaces them in the actions rotor / local context menu on the row.
+  // Note the deps: callers pass inline action objects, so memoising on the
+  // object identities would never hit. The callbacks themselves are stable
+  // (useCallback upstream); the labels are what the memo actually reads.
+  const rightLabel = right?.label;
+  const rightTrigger = right?.onTrigger;
+  const leftLabel = left?.label;
+  const leftTrigger = left?.onTrigger;
+
   const a11yActions = useMemo(() => {
     const actions: { name: string; label: string }[] = [];
-    if (right) actions.push({ name: 'swipeRight', label: right.label });
-    if (left) actions.push({ name: 'swipeLeft', label: left.label });
+    if (rightLabel) actions.push({ name: 'swipeRight', label: rightLabel });
+    if (leftLabel) actions.push({ name: 'swipeLeft', label: leftLabel });
     return actions;
-  }, [right, left]);
+  }, [rightLabel, leftLabel]);
 
   const onA11yAction = useCallback(
     (event: { nativeEvent: { actionName: string } }) => {
-      const action = event.nativeEvent.actionName === 'swipeRight' ? right : left;
+      const trigger =
+        event.nativeEvent.actionName === 'swipeRight' ? rightTrigger : leftTrigger;
       // No spring to settle — the row never moved — so trigger directly.
-      action?.onTrigger();
+      trigger?.();
     },
-    [right, left]
+    [rightTrigger, leftTrigger]
   );
 
   const pan = Gesture.Pan()
@@ -178,11 +187,7 @@ export function SwipeableChatRow({ children, right, left, enabled = true }: Prop
   };
 
   return (
-    <View
-      style={[styles.wrapper, { backgroundColor: theme.colors.bg }]}
-      accessibilityActions={a11yActions}
-      onAccessibilityAction={onA11yAction}
-    >
+    <View style={[styles.wrapper, { backgroundColor: theme.colors.bg }]}>
       {renderPanel(right, 'right')}
       {renderPanel(left, 'left')}
 
@@ -193,7 +198,15 @@ export function SwipeableChatRow({ children, right, left, enabled = true }: Prop
             { transform: [{ translateX }] },
           ]}
         >
-          {children}
+          {/* The wrapper View above is not an accessible element, so actions
+              declared on it never reach AT. They ride on the row itself instead,
+              which already owns the label they act on. */}
+          {React.isValidElement<{ swipeActions?: unknown; onSwipeAction?: unknown }>(children)
+            ? React.cloneElement(children, {
+                swipeActions: a11yActions,
+                onSwipeAction: onA11yAction,
+              })
+            : children}
         </Animated.View>
       </GestureDetector>
     </View>
@@ -202,11 +215,13 @@ export function SwipeableChatRow({ children, right, left, enabled = true }: Prop
 
 const styles = StyleSheet.create({
   wrapper: { overflow: 'hidden' },
+  // Clipped to the drag distance, not half the row: a 50% wash reads as a
+  // selection state rather than a revealed action.
   panel: {
     position: 'absolute',
     top: 0,
     bottom: 0,
-    width: '50%',
+    width: MAX_DRAG,
     justifyContent: 'center',
   },
   panelRight: { left: 0, alignItems: 'flex-start', paddingLeft: 24 },

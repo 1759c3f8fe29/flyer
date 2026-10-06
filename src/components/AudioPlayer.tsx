@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { StyleSheet, Text, View } from 'react-native';
 import { Audio, type AVPlaybackStatus } from 'expo-av';
 import { useTheme } from '@/src/theme/ThemeProvider';
@@ -59,7 +59,10 @@ export function AudioPlayer({ uri, durationMs, messageId, tint, trackColor, seed
   const [positionMs, setPositionMs] = useState(0);
   const [totalMs, setTotalMs] = useState(durationMs ?? 0);
 
-  const bars = useRef(barsFor(seed)).current;
+  // Memoised, not ref-frozen: the effect below reloads the Sound when the uri
+  // changes under a stable messageId (re-signed URLs), and a stale bar pattern
+  // would then draw one note's waveform over another's audio.
+  const bars = useMemo(() => barsFor(seed), [seed]);
   const [rate, setRate] = useState(preferredRate);
 
   // False from the moment cleanup runs. expo-av keeps calling the status callback
@@ -241,6 +244,9 @@ export function AudioPlayer({ uri, durationMs, messageId, tint, trackColor, seed
           onPress={cycleRate}
           haptic
           accessibilityLabel={`Playback speed ${rate}×, tap to change`}
+          // ~20px tall visually; slop reaches the 44dp floor without growing
+          // the bubble row.
+          hitSlop={12}
           style={[styles.ratePill, { backgroundColor: trackColor }]}
         >
           <Text style={[styles.rateLabel, { color: tint }]}>{rate}×</Text>

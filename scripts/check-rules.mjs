@@ -225,9 +225,13 @@ if (result.status !== 0) {
   }
   // Rules failures arrive as warning lines rather than a stack, so surface those
   // specifically and fall back to the whole output if the shape ever changes.
+  // The `i`-prefix clause drops only firebase-tools' own info lines (`i`
+  // followed by its two-space gutter, e.g. `i  emulators: …`): the previous
+  // version dropped *any* line starting with the letter i, hiding real
+  // diagnostics like `invalid …`.
   const diagnostics = output
     .split('\n')
-    .filter((l) => /rules|Illegal|Syntax|error/i.test(l) && !/^\s*i\s/.test(l))
+    .filter((l) => /rules|Illegal|Syntax|error/i.test(l) && !/^\s*i\s{2,}/.test(l))
     .join('\n');
   console.error('\ndatabase.rules.json does not compile:\n');
   console.error(diagnostics.trim() || output.trim());

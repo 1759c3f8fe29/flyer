@@ -50,7 +50,13 @@ export function TypingIndicator() {
   }, [dots]);
 
   return (
-    <View style={styles.row} accessibilityRole="text" accessibilityLabel="Typing">
+    <View
+      style={styles.row}
+      accessible
+      accessibilityRole="alert"
+      accessibilityLiveRegion="polite"
+      accessibilityLabel="Typing"
+    >
       <View style={[styles.bubble, { backgroundColor: theme.colors.bubbleIn }]}>
         {dots.map((value, index) => (
           <Animated.View

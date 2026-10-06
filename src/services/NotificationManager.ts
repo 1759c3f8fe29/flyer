@@ -18,6 +18,7 @@ export interface Banner {
   senderId: string;
   title: string;
   body: string;
+  messageId?: string;
 }
 
 type Navigate = (path: string) => void;
@@ -86,8 +87,11 @@ export async function start(uid: string): Promise<void> {
   // Tapped a notification that cold-started the app.
   const initial = await messaging().getInitialNotification();
   if (initial) {
-    // Defer: the router is not mounted yet on the very first tick.
-    setTimeout(() => handleTap(initial), 600);
+    // Defer: the router is not mounted yet on the very first tick. Tracked so
+    // stop() can cancel it — a sign-out inside the window would otherwise land
+    // the next session on the previous account's chat.
+    const timer = setTimeout(() => handleTap(initial), 600);
+    teardown.push(() => clearTimeout(timer));
   }
 }
 
@@ -120,17 +124,31 @@ function handleForeground(message: FirebaseMessagingTypes.RemoteMessage) {
   // Reactions banner through the same path as messages: both are "someone did
   // something in a chat you are not looking at", and both open that chat.
   if (data.kind === 'message' || data.kind === 'reaction') {
-    const { chatId, senderId } = data;
+    const { chatId, senderId, messageId } = data;
     if (!chatId) return;
 
+    // Blocked first: a delivery receipt confirms activity to someone the user
+    // blocked, so a blocked sender gets neither banner nor receipt.
+    const blocked = Boolean(senderId && appState.get().blocked[senderId]);
+
+    // N-02: a push that reached a live app is delivered, whether or not the
+    // user opens the chat. The background handler covers the killed case.
+    const myUid = appState.get().currentUser?.uid;
+    if (!blocked && data.kind === 'message' && myUid && messageId && senderId !== myUid) {
+      void write(Paths.deliveredTo(chatId, messageId, myUid), serverTimestamp()).catch(
+        () => {}
+      );
+    }
+
     if (appState.get().activeChatId === chatId) return;
-    if (appState.get().blocked[senderId]) return;
+    if (blocked) return;
 
     bannerHandler?.({
       chatId,
       senderId: senderId ?? '',
       title: message.notification?.title ?? 'New message',
       body: message.notification?.body ?? '',
+      messageId,
     });
   }
 
@@ -145,10 +163,21 @@ function handleTap(message: FirebaseMessagingTypes.RemoteMessage) {
   if ((data.kind === 'message' || data.kind === 'reaction') && data.chatId) {
     navigate(`/chat/${data.chatId}`);
   }
+  // N-04: a missed call is over — the live call screen would show a dead call.
+  // Route to the caller's chat instead, carrying who rang.
+  if (data.kind === 'missed_call' && data.chatId) {
+    navigate(`/chat/${data.chatId}`);
+  }
   if (data.kind === 'call') {
     navigate('/call');
   }
 }
+
+// N-05 badge, deliberately absent: the icon count must be the *total* across
+// all chats, and the function does not have it without reading every chat per
+// message. RNFirebase messaging v21 exposes no client badge API either, so the
+// honest state is "no icon badge" until either a badge-capable dependency or a
+// server-side unread total lands — not a wrong number.
 
 // No exported ensureChannels: there is intentionally no per-call channel setup
 // in JS. RNFirebase does not create notification channels natively (a payload

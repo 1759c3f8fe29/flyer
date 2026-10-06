@@ -19,7 +19,7 @@ export function EmptyState({ icon, title, body, actionLabel, onAction }: Props) 
   return (
     <View style={styles.container}>
       <View style={[styles.iconCircle, { backgroundColor: theme.colors.surfaceAlt }]}>
-        <Icon name={icon} size={32} color={theme.colors.textFaint} />
+        <Icon name={icon} size={32} color={theme.colors.textMuted} />
       </View>
 
       <Text style={[styles.title, { color: theme.colors.text }]}>{title}</Text>

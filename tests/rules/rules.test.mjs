@@ -297,6 +297,66 @@ describe('BUG-03 · blocking is enforced server-side', () => {
 });
 
 /* ------------------------------------------------------------------ *
+ * BUG-37 — blocking did not block calls
+ * ------------------------------------------------------------------ */
+
+describe('BUG-37 · blocking is enforced on calls', () => {
+  const call = (caller, callee) => ({
+    callerId: caller,
+    calleeId: callee,
+    type: 'voice',
+    state: 'ringing',
+    createdAt: 1,
+  });
+  const pointer = (callId, caller) => ({
+    callId,
+    callerId: caller,
+    type: 'voice',
+    createdAt: 1,
+  });
+
+  before(async () => {
+    await reset();
+  });
+
+  it('allows a call when no block exists', async () => {
+    await assertSucceeds(set(ref(asAlice(), 'calls/c1'), call(ALICE, BOB)));
+    await assertSucceeds(set(ref(asAlice(), `incoming/${BOB}/c1`), pointer('c1', ALICE)));
+  });
+
+  it('denies the blocked user creating a call node', async () => {
+    await seed(async (db) => {
+      await set(ref(db, `blocks/${BOB}/${ALICE}`), true);
+      await set(ref(db, `blockPairs/${AB}/${BOB}`), true);
+    });
+    // Same pair id the message rule consults, in the caller->callee order and
+    // the reverse — exactly one of the two joins can exist.
+    await assertFails(set(ref(asAlice(), 'calls/c2'), call(ALICE, BOB)));
+  });
+
+  it('denies the blocked user writing the ring pointer', async () => {
+    await assertFails(set(ref(asAlice(), `incoming/${BOB}/c2`), pointer('c2', ALICE)));
+  });
+
+  it('denies the blocker calling too, so blocking is not one-way', async () => {
+    await assertFails(set(ref(asBob(), 'calls/c3'), call(BOB, ALICE)));
+  });
+
+  it('still lets the callee clear a stale pointer', async () => {
+    await assertSucceeds(set(ref(asBob(), `incoming/${BOB}/c1`), null));
+  });
+
+  it('allows calling again once unblocked', async () => {
+    await seed(async (db) => {
+      await set(ref(db, `blocks/${BOB}/${ALICE}`), null);
+      await set(ref(db, `blockPairs/${AB}/${BOB}`), null);
+    });
+    await assertSucceeds(set(ref(asAlice(), 'calls/c4'), call(ALICE, BOB)));
+    await assertSucceeds(set(ref(asAlice(), `incoming/${BOB}/c4`), pointer('c4', ALICE)));
+  });
+});
+
+/* ------------------------------------------------------------------ *
  * BUG-04 — any authenticated user could dump the user table
  * ------------------------------------------------------------------ */
 
@@ -427,4 +487,225 @@ describe('owner-only subtrees', () => {
       await assertSucceeds(get(ref(asAlice(), `${node}/${ALICE}`)));
     });
   }
+});
+
+/* ------------------------------------------------------------------ *
+ * BUG-10 — edit and delete-for-everyone expire
+ * ------------------------------------------------------------------ */
+
+describe('BUG-10 · edit/delete time window', () => {
+  const OLD = Date.now() - 3 * 24 * 60 * 60 * 1000;
+
+  before(async () => {
+    await reset();
+    await seed(async (db) => {
+      await set(ref(db, `chats/${AB}`), {
+        participants: { [ALICE]: true, [BOB]: true },
+        lastTimestamp: 1,
+      });
+      await set(ref(db, `messages/${AB}/old`), {
+        senderId: ALICE,
+        type: 'text',
+        text: 'ancient',
+        timestamp: OLD,
+      });
+      await set(ref(db, `messages/${AB}/fresh`), {
+        senderId: ALICE,
+        type: 'text',
+        text: 'just now',
+        timestamp: Date.now(),
+      });
+    });
+  });
+
+  it('allows editing a fresh message', async () => {
+    await assertSucceeds(update(ref(asAlice(), `messages/${AB}/fresh`), { text: 'edited' }));
+  });
+
+  it('denies editing a 3-day-old message', async () => {
+    await assertFails(update(ref(asAlice(), `messages/${AB}/old`), { text: 'rewritten' }));
+  });
+
+  it('denies deleting a 3-day-old message for everyone', async () => {
+    await assertFails(update(ref(asAlice(), `messages/${AB}/old`), { deleted: true }));
+  });
+
+  it('allows deleting a fresh message for everyone', async () => {
+    await assertSucceeds(update(ref(asAlice(), `messages/${AB}/fresh`), { deleted: true }));
+  });
+
+  it('still allows scrubbing the payload of an old message', async () => {
+    // Null writes skip .validate and the time-windowed leaves exempt them, so
+    // delete-for-everyone keeps wiping content after the flag itself expires.
+    await assertSucceeds(
+      update(ref(asAlice(), `messages/${AB}/old`), { text: null, mediaUrl: null })
+    );
+  });
+
+  it('denies the peer editing at any age', async () => {
+    await assertFails(update(ref(asBob(), `messages/${AB}/fresh`), { text: 'hijacked' }));
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * BUG-25 — media payloads are host-pinned and bounded
+ * ------------------------------------------------------------------ */
+
+describe('BUG-25 · media validation', () => {
+  const image = (overrides = {}) => ({
+    senderId: ALICE,
+    type: 'image',
+    timestamp: serverTimestamp(),
+    mediaUrl: 'https://res.cloudinary.com/demo/image/upload/x.jpg',
+    width: 800,
+    height: 600,
+    ...overrides,
+  });
+
+  before(async () => {
+    await reset();
+    await seed(async (db) => {
+      await set(ref(db, `chats/${AB}`), {
+        participants: { [ALICE]: true, [BOB]: true },
+        lastTimestamp: 1,
+      });
+    });
+  });
+
+  it('allows a Cloudinary-hosted image', async () => {
+    await assertSucceeds(set(ref(asAlice(), `messages/${AB}/ok`), image()));
+  });
+
+  it('denies a bubble pointing at a third-party host', async () => {
+    await assertFails(
+      set(ref(asAlice(), `messages/${AB}/evil`), image({ mediaUrl: 'https://evil.example/x.jpg' }))
+    );
+  });
+
+  it('denies non-positive dimensions', async () => {
+    await assertFails(set(ref(asAlice(), `messages/${AB}/w0`), image({ width: 0 })));
+    await assertFails(set(ref(asAlice(), `messages/${AB}/hn`), image({ height: -5 })));
+  });
+
+  it('denies absurd dimensions and durations', async () => {
+    await assertFails(set(ref(asAlice(), `messages/${AB}/wbig`), image({ width: 20000 })));
+    await assertFails(
+      set(
+        ref(asAlice(), `messages/${AB}/long`),
+        image({ type: 'audio', mediaUrl: 'https://res.cloudinary.com/demo/video/upload/x.mp3', durationMs: 99999999 })
+      )
+    );
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * BUG-26 — `type` is sender-pinned
+ * ------------------------------------------------------------------ */
+
+describe('BUG-26 · message type is pinned to the sender', () => {
+  before(async () => {
+    await reset();
+    await seed(async (db) => {
+      await set(ref(db, `chats/${AB}`), {
+        participants: { [ALICE]: true, [BOB]: true },
+        lastTimestamp: 1,
+      });
+      await set(ref(db, `messages/${AB}/m1`), {
+        senderId: ALICE,
+        type: 'text',
+        text: 'hello',
+        timestamp: Date.now(),
+      });
+    });
+  });
+
+  it('denies the peer flipping the type', async () => {
+    await assertFails(update(ref(asBob(), `messages/${AB}/m1`), { type: 'image' }));
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * N-02 — delivered receipts mirror seen receipts
+ * ------------------------------------------------------------------ */
+
+describe('N-02 · deliveredTo receipts', () => {
+  before(async () => {
+    await reset();
+    await seed(async (db) => {
+      await set(ref(db, `chats/${AB}`), {
+        participants: { [ALICE]: true, [BOB]: true },
+        lastTimestamp: 1,
+      });
+      await set(ref(db, `messages/${AB}/m1`), {
+        senderId: ALICE,
+        type: 'text',
+        text: 'hello',
+        timestamp: Date.now(),
+      });
+    });
+  });
+
+  it('lets the recipient mark delivery on their own key', async () => {
+    await assertSucceeds(set(ref(asBob(), `messages/${AB}/m1/deliveredTo/${BOB}`), 1));
+  });
+
+  it('denies writing another device\'s key', async () => {
+    await assertFails(set(ref(asAlice(), `messages/${AB}/m1/deliveredTo/${BOB}`), 1));
+  });
+
+  it('denies outsiders marking delivery', async () => {
+    await assertFails(set(ref(asCarol(), `messages/${AB}/m1/deliveredTo/${CAROL}`), 1));
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * BUG-14 — join order lives in memberSince
+ * ------------------------------------------------------------------ */
+
+describe('BUG-14 · memberSince seniority', () => {
+  const G = 'group1';
+
+  before(async () => {
+    await reset();
+    await seed(async (db) => {
+      await set(ref(db, `chats/${G}`), {
+        participants: { [ALICE]: true, [BOB]: true },
+        admins: { [ALICE]: true },
+        isGroup: true,
+        lastTimestamp: 1,
+      });
+    });
+  });
+
+  it('lets an admin record a join', async () => {
+    await assertSucceeds(set(ref(asAlice(), `memberSince/${G}/${BOB}`), 100));
+  });
+
+  it('denies a non-admin recording joins', async () => {
+    await assertFails(set(ref(asBob(), `memberSince/${G}/${CAROL}`), 200));
+  });
+
+  it('lets a member clear their own entry on leave', async () => {
+    await assertSucceeds(set(ref(asBob(), `memberSince/${G}/${BOB}`), null));
+  });
+
+  it('lets participants read the node', async () => {
+    await assertSucceeds(get(ref(asBob(), `memberSince/${G}`)));
+  });
+
+  it('hides the node from outsiders', async () => {
+    await assertFails(get(ref(asCarol(), `memberSince/${G}`)));
+  });
+
+  it('accepts the optional hidePreview privacy flag', async () => {
+    await assertSucceeds(
+      set(ref(asAlice(), `users/${ALICE}/privacy`), {
+        showLastSeen: true,
+        showPhoto: true,
+        showAbout: true,
+        readReceipts: true,
+        hidePreview: true,
+      })
+    );
+  });
 });

@@ -45,6 +45,7 @@ const PRIVACY_ROWS: {
   { key: 'showPhoto', title: 'Profile photo', subtitle: 'Show your photo to other people' },
   { key: 'showAbout', title: 'About', subtitle: 'Show your about text on your profile' },
   { key: 'readReceipts', title: 'Read receipts', subtitle: 'Send blue ticks when you read a message' },
+  { key: 'hidePreview', title: 'Hide message previews', subtitle: 'Lock-screen notifications show “New message” instead' },
 ];
 
 export default function SettingsScreen() {
@@ -173,7 +174,10 @@ export default function SettingsScreen() {
                 <Switch
                   value={privacy[row.key]}
                   onValueChange={(v) => void setPrivacy(row.key, v)}
-                  disabled={!uid}
+                  // A second tap mid-save used to be silently swallowed by the
+                  // savingPrivacy guard with no visual feedback; disabling
+                  // shows the control is busy instead of ignoring the user.
+                  disabled={!uid || savingPrivacy}
                   accessibilityLabel={row.title}
                 />
               }

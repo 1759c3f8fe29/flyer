@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { useShallow } from 'zustand/react/shallow';
 import { Limits } from '@/src/config/env';
+import { serverNow } from './FirebaseService';
 import type {
   CallRecord,
   CallState,
@@ -316,7 +317,9 @@ const TYPING_STALE_MS = Limits.typingIdleMs + 1000;
 export const selectPeerTyping = (chatId: string, myUid: string) => (s: AppState) => {
   const map = s.typingState[chatId];
   if (!map) return false;
-  const cutoff = Date.now() - TYPING_STALE_MS;
+  // BUG-32: writers stamp server time (see setTyping), so the read side must
+  // judge against server time too — not the reader's wall clock.
+  const cutoff = serverNow() - TYPING_STALE_MS;
   return Object.entries(map).some(([uid, ts]) => uid !== myUid && ts > cutoff);
 };
 

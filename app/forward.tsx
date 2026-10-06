@@ -1,4 +1,4 @@
-import React, { useCallback, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   FlatList,
@@ -15,7 +15,7 @@ import { Avatar } from '@/src/components/Avatar';
 import { Icon } from '@/src/components/Icon';
 import { Pressable } from '@/src/components/Pressable';
 import { alertError } from '@/src/components/Confirm';
-import { forwardMessage, previewFor } from '@/src/services/ChatEngine';
+import { forwardMessage, previewFor, readMessage } from '@/src/services/ChatEngine';
 import { useAppStore } from '@/src/services/StateManager';
 
 /** How many contacts one tap can forward to, matching WhatsApp's own cap. */
@@ -55,19 +55,54 @@ export default function ForwardScreen() {
   // Two entry points land here: the single-message action sheet sends
   // `messageId`, and selection mode sends a comma-separated `messageIds`. Both
   // resolve to a list so the send path below has one shape to handle.
+  //
+  // Anything older than the loaded window is fetched directly: the chat screen
+  // pages into local `older` state, never the store, so a scrolled-up message
+  // used to resolve to an empty preview and a silent no-op send.
+  const ids = useMemo(
+    () =>
+      messageIds
+        ? messageIds.split(',').filter(Boolean)
+        : messageId
+          ? [messageId]
+          : [],
+    [messageIds, messageId]
+  );
+  const [fetched, setFetched] = useState<Message[]>([]);
+  useEffect(() => {
+    if (!chatId || ids.length === 0) return;
+    const pool = messages[chatId] ?? [];
+    const have = new Set(pool.map((m) => m.id));
+    const missing = ids.filter((id) => !have.has(id));
+    if (missing.length === 0) return;
+    let cancelled = false;
+    void (async () => {
+      const rows: Message[] = [];
+      for (const id of missing) {
+        try {
+          const row = await readMessage(chatId, id);
+          if (row) rows.push(row);
+        } catch {
+          /* offline or denied — the row stays missing */
+        }
+      }
+      if (!cancelled) setFetched(rows);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [chatId, ids, messages]);
+
   const forwardList: Message[] = useMemo(() => {
     if (!chatId) return [];
     const pool = messages[chatId] ?? [];
-    const ids = messageIds
-      ? messageIds.split(',').filter(Boolean)
-      : messageId
-        ? [messageId]
-        : [];
     // Preserve transcript order rather than selection order, so a forwarded
     // thread reads the same way it did in the original chat.
     const wanted = new Set(ids);
-    return pool.filter((m) => wanted.has(m.id));
-  }, [messages, chatId, messageId, messageIds]);
+    return [...pool.filter((m) => wanted.has(m.id)), ...fetched.filter((m) => wanted.has(m.id))]
+      .filter((m, i, all) => all.findIndex((x) => x.id === m.id) === i)
+      .sort((a, b) => a.timestamp - b.timestamp);
+  }, [messages, fetched, chatId, ids]);
 
   /** The single message, when there is exactly one — drives the preview card. */
   const message: Message | null = forwardList.length === 1 ? forwardList[0] : null;

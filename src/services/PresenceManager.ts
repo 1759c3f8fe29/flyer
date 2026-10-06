@@ -27,7 +27,7 @@ let teardown: (() => void)[] = [];
 let activeUid: string | null = null;
 
 export function startPresence(uid: string) {
-  stopPresence();
+  void stopPresence();
   activeUid = uid;
 
   const presencePath = Paths.userPresence(uid);
@@ -86,7 +86,7 @@ export function startPresence(uid: string) {
   teardown.push(offNet);
 }
 
-export function stopPresence() {
+export async function stopPresence(): Promise<void> {
   for (const fn of teardown) {
     try {
       fn();
@@ -96,13 +96,24 @@ export function stopPresence() {
   }
   teardown = [];
 
-  if (activeUid) {
-    // Drop the handler so a later reconnect on a different account does not
-    // write offline into the previous user's profile.
-    cancelOnDisconnect(Paths.userPresence(activeUid)).catch(() => {});
-    cancelOnDisconnect(Paths.userLastSeen(activeUid)).catch(() => {});
+  const uid = activeUid;
+  if (uid) {
+    // Order matters, and so does failure. Cancelling the death certificate
+    // unconditionally means an offline sign-out leaves online:true with nothing
+    // left to clear it. Only cancel once the explicit write below resolves —
+    // while offline it pends until reconnect, so the certificates stay armed
+    // for exactly as long as the write is unconfirmed, and the socket drop from
+    // the auth sign-out that follows fires them within the server timeout.
+    try {
+      await update(Paths.user(uid), { online: false, lastSeen: serverTimestamp() });
+      cancelOnDisconnect(Paths.userPresence(uid)).catch(() => {});
+      cancelOnDisconnect(Paths.userLastSeen(uid)).catch(() => {});
+    } catch {
+      /* offline — the armed onDisconnect handler covers it */
+    }
   }
-  activeUid = null;
+  // Guarded: stopPresence is async now, so a newer session may own the slot.
+  if (activeUid === uid) activeUid = null;
 }
 
 /** "online" | "last seen today at 14:03" | "last seen 12/06/2025" */

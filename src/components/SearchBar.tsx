@@ -9,6 +9,11 @@ interface Props {
   onChangeText: (value: string) => void;
   onClose: () => void;
   placeholder?: string;
+  /**
+   * Opt-in: popping the keyboard uninvited traps the user in it, so only the
+   * screen that just revealed this field asks for focus.
+   */
+  autoFocus?: boolean;
 }
 
 /**
@@ -16,14 +21,16 @@ interface Props {
  * clear and dismisses search once the field is empty, so a single thumb position
  * covers both intents.
  */
-export function SearchBar({ value, onChangeText, onClose, placeholder = 'Search' }: Props) {
+export function SearchBar({ value, onChangeText, onClose, placeholder = 'Search', autoFocus = false }: Props) {
   const theme = useTheme();
   const inputRef = useRef<TextInput>(null);
 
   const hasText = value.length > 0;
 
   return (
-    <View style={[styles.pill, { backgroundColor: theme.colors.bgElevated }]}>
+    // bgElevated matches the header behind this pill, so the field needs its
+    // own fill and hairline to read as a field at all.
+    <View style={[styles.pill, { backgroundColor: theme.colors.surfaceAlt, borderColor: theme.colors.border }]}>
       <Icon name="search" size={20} color={theme.colors.textMuted} style={styles.leading} />
 
       <TextInput
@@ -33,7 +40,7 @@ export function SearchBar({ value, onChangeText, onClose, placeholder = 'Search'
         placeholder={placeholder}
         placeholderTextColor={theme.colors.textFaint}
         style={[styles.input, { color: theme.colors.text }]}
-        autoFocus
+        autoFocus={autoFocus}
         autoCorrect={false}
         autoCapitalize="none"
         returnKeyType="search"
@@ -49,7 +56,7 @@ export function SearchBar({ value, onChangeText, onClose, placeholder = 'Search'
             onClose();
           }
         }}
-        round={36}
+        round={44}
         accessibilityLabel={hasText ? 'Clear search' : 'Close search'}
       >
         <Icon name="close" size={16} color={theme.colors.textMuted} />
@@ -63,6 +70,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     borderRadius: 22,
+    borderWidth: StyleSheet.hairlineWidth,
     paddingLeft: 12,
     paddingRight: 2,
     minHeight: 44,

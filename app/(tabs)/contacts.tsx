@@ -57,7 +57,7 @@ export default function ContactsScreen() {
       setOpening(peerUid);
       try {
         const chatId = await ensureChat(myUid, peerUid);
-        router.replace(`/chat/${chatId}`);
+        router.push(`/chat/${chatId}`);
       } catch (e) {
         console.warn('[Flyer/contacts] could not open chat', e);
         alertError('Could not open chat', 'Please try again.');

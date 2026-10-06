@@ -8,14 +8,203 @@ so you can verify each one yourself before you touch it.
 Contents:
 
 - Part 0 — Rules of engagement
+- Part 0.5 — Session 3 re-audit (2026-08-11): what changed since this was written
+- Part 0.6 — Session 4 audit (2026-08-21): the locked/killed-device path
 - Part 1 — Ground truth: what already exists (do not rebuild)
-- Part 2 — Confirmed bugs (29), in fix order
+- Part 2 — Confirmed bugs (41), in fix order
 - Part 3 — WhatsApp feature parity (30 features), in ship order
 - Part 4 — What to remove or replace
 - Part 5 — Production hardening (verified absent)
 - Part 6 — Performance and scale
 - Part 7 — Beyond parity: reasons to switch to Flyer
-- Part 8 — Execution order and reporting contract
+- Part 8 — Notification and call reliability ("WhatsApp level")
+- Part 9 — Execution order and reporting contract
+
+---
+
+## Part 0.5 — Session 3 re-audit (2026-08-11)
+
+This document was first written on 2026-08-07. The codebase has moved since then.
+Re-reading every service, the rules file, `functions/index.js`, and all the
+screens shows that **many Part 2 bugs are already fixed**. This section records
+the current truth so nobody wastes a session re-fixing them. Verify by reading,
+but these were all confirmed against the current source.
+
+### Already fixed — do NOT redo
+
+- **BUG-03 (blocking)** — `blockPairs/{chatId}/{uid}` now exists
+  (`database.rules.json:336`), the message create rule enforces it
+  (`database.rules.json:210`), and `blockUser`/`unblockUser`
+  (`ChatEngine.ts:962`) write both halves in one fan-out. `isBlockedByPeer` is
+  gone, replaced by `listenToBlockPair`.
+- **BUG-04 (user-table dump)** — parent `.read` removed from `users` and
+  `usernames`; per-row read only. `fetchAllUsers` deleted; discovery now goes
+  through the `searchUsers` callable (`functions/index.js:773`) with a
+  3-char minimum and 20-result cap. `DirectoryService.ts` is the only client
+  entry point.
+- **BUG-07 (outbox leaks across accounts)** — storage key is per-uid
+  (`OfflineQueue.ts:29`), `startOutbox(uid)` swaps the in-memory queue, and
+  `stopOutbox()` clears it. A legacy-shared-key migration adopts only items the
+  current session actually sent.
+- **BUG-09 (outbox head-of-line blocking)** — `flush()` now stalls only the
+  failing chat (`stalled` set, `OfflineQueue.ts:160`) instead of `break`-ing the
+  whole queue.
+- **BUG-20 (mute forever)**, **BUG-21 (system-message pushes)**, **BUG-22
+  (group push title)**, **BUG-23 (reaction pushes)** — all four fixed in
+  `functions/index.js`: the mute sentinel is `until < 0 || until > now`
+  (`:378`), system rows early-return (`:344`), group titles are
+  `senderName @ chat.name` (`:365`), and `onReactionCreated` (`:442`) notifies
+  the author only.
+- **BUG-24 (typing lingers)** — `TYPING_STALE_MS = Limits.typingIdleMs + 1000`
+  (`StateManager.ts:314`), derived from the same constant.
+- **BUG-25 / BUG-26 (message payload validation, `type` pinning)** — the rules
+  now validate `text` length, `type` against the enum, `timestamp === now`, and
+  every mutable leaf is sender-guarded (`database.rules.json:203-291`).
+- **F-30 (draft persistence)** — `DraftService.ts` exists and is wired into
+  `Composer.tsx` (load/save/clear + foreground flush). It was never missing; the
+  original audit did not find the file.
+- **S-04 (thumbnail variants)** — `transformed()`, `thumbUrl()`, and
+  `videoPoster()` exist in `MediaManager.ts`; profile photo and media viewers
+  already use transformation URLs.
+
+### Still open — confirmed against current source
+
+- **BUG-05** — Cloudinary uploads are still unsigned (`MediaManager.ts:12`).
+- **BUG-06** — ICE is still STUN-only (`env.ts:62`); no TURN.
+- **BUG-10** — no time window on edit/delete. The rules (`:223-234`) and the
+  chat screen both still allow editing/deleting a message from last year.
+- **BUG-11** — `listenToMessages` still `onValue`s a `limitToLast(40)` query
+  (`ChatEngine.ts:207`); every new message re-downloads the whole window.
+- **BUG-12** — `clearedAt`/`hiddenFor` are still client-side filters only.
+- **BUG-15** — `deleteAccount` still leaves ghost rows in others' contacts and
+  group participant lists.
+- **BUG-16** — no rate limiting anywhere.
+- **BUG-18** — privacy settings are still booleans (everyone/nobody), not
+  WhatsApp's granular controls.
+- **BUG-27** — reaction count still unbounded.
+- **BUG-28** — `chats/$chatId/lastMessage` is still writable by any participant
+  (`database.rules.json:141`).
+- **H-01…H-06, S-01…S-03, S-05…S-08** — unchanged; all still open.
+
+### New, confirmed in this session (session 3)
+
+**BUG-30 · P1 · deleting a chat resurrects it when offline messages flush.**
+`deleteChatForMe` (`ChatEngine.ts:1018`) clears `clearedAt`, unread, and the
+`userChats` index, but never calls `clearQueueForChat` — which exists
+(`OfflineQueue.ts:207`) and is called **nowhere**. If the chat has queued
+offline sends, `flush()` replays them after reconnect, `commitMessage` re-writes
+`userChats/{myUid}/{chatId}/lastTimestamp`, and the chat the user deleted
+reappears in their list with the very messages they deleted. **Fix:** call
+`clearQueueForChat(chatId)` inside `deleteChatForMe`, and do the same in
+`leaveGroup` so leaving a group does not leave stale queued attempts.
+
+**BUG-31 · P2 · failed calls record as "missed" in history.**
+`onCallStateChanged` computes `missed = answeredAt === 0` from the call record.
+A call whose *setup* failed (`startCall` catch → `hangUp('failed')`) or whose
+ICE never connected still has `answeredAt` null, so the caller's history shows a
+missed call for something that was never answered. The richer `endedReason` is
+written on the call node but not carried into history. **Fix:** copy
+`endedReason` into the history entry and derive the UI label from it.
+
+### WhatsApp parity — what actually works, verified by reading
+
+Legend: ✅ works, ⚠️ works but limited, ❌ missing.
+
+| WhatsApp feature | Flyer | Where / gap |
+|---|---|---|
+| 1:1 chat | ✅ | Full: text, media, voice, receipts, typing |
+| Group chat | ✅ | 256 max, admins, add/remove/leave, rename, photo, description, "You, A, B" subtitle |
+| Group admin grant/revoke | ✅ | `group/[chatId].tsx` |
+| Text / image / video / audio | ✅ | — |
+| Reply | ✅ | Plus swipe-to-reply ❌ (long-press only) |
+| Forward | ✅ | Multi-select forward too |
+| Edit | ⚠️ | Text-only, no 15-min window (BUG-10), no caption edit |
+| Delete for me / everyone | ✅ | Time-window limit missing (BUG-10) |
+| Reactions | ✅ | Author gets a push |
+| Multi-select actions | ✅ | Star, copy, forward, delete |
+| Star messages | ✅ | Tap jumps to message ✅ |
+| Pin / archive / mute chat | ✅ | Mute options 8h/1w/always ✅ |
+| Mark as unread | ❌ | Not present anywhere |
+| In-chat search | ❌ | Global chat-list search only |
+| Drafts | ✅ | `DraftService`, per-chat, survives restart |
+| Documents / files | ❌ | Explicitly excluded in `AttachSheet.tsx` |
+| Location | ❌ | — |
+| Contact cards | ❌ | — |
+| Polls | ❌ | — |
+| Stickers / GIFs | ❌ | — |
+| View-once media | ❌ | — |
+| Disappearing messages | ❌ | — |
+| Scheduled messages | ❌ | — |
+| Group invite links | ❌ | — |
+| Broadcast lists | ❌ | — |
+| Communities | ❌ | — |
+| Pinned messages in a chat | ❌ | Chat-pin exists; message-pin doesn't |
+| 1:1 voice/video calls | ⚠️ | WebRTC + CallKeep + PiP. Android rings from a cold start; **iOS cannot ring a terminated app** — no PushKit VoIP (BUG-39). Blocking is not enforced on calls (BUG-37) |
+| Call history | ⚠️ | Incoming/outgoing/missed, delete, clear — but written only by Cloud Functions, so empty without Blaze (BUG-41) |
+| Group calls | ❌ | 1:1 only |
+| Status / stories | ❌ | — |
+| Online / last-seen / typing | ✅ | Privacy toggles for last-seen ✅ |
+| Read receipts | ✅ | Blue ticks + mutual toggle |
+| Blocking | ⚠️ | Enforced for messages (BUG-03 fixed); **not for calls** (BUG-37) |
+| Report user | ✅ | 4 reasons |
+| Contact request handshake | ✅ | Username/email based (no phone sync) |
+| Profile (name/photo/about/username) | ✅ | Username unique + availability check |
+| Light/dark/system theme | ✅ | — |
+| Chat wallpaper | ⚠️ | Single theme colour; no per-chat choice |
+| Push notifications | ⚠️ | Per-chat mute ✅; mentions ❌; reaction ✅. Requires Blaze (BUG-41); Android channel missing (BUG-40) |
+| Offline send queue | ✅ | Per-uid, per-chat ordering, retry UI |
+| Smart replies | ✅ | Mistral, off by default |
+| Privacy: last-seen/photo/about | ⚠️ | Booleans, not everyone/contacts/nobody |
+| E2E encryption | ❌ | Plaintext in RTDB |
+| Multi-device / web | ❌ | — |
+| Backup / restore | ❌ | — |
+| Chat export | ❌ | — |
+| Search people | ✅ | `searchUsers` callable, handle/email |
+
+**Bottom line:** the messaging core is complete and most of it works. The gaps
+are the extras people expect on top — documents, location, stories, group
+calls, disappearing messages — plus the two big architectural items (E2E
+encryption, multi-device). Everything marked ✅ above was verified working by
+reading the code path end to end; nothing in that column is assumed.
+
+**One caveat on the ✅ column, added in session 4:** "works" above means the code
+path is correct and complete, *given a deployed backend*. The rows that depend on
+Cloud Functions — push notifications, reaction pushes, call history, search
+people, smart replies, and the push half of 1:1 calls — cannot be deployed on the
+Spark plan at all. See BUG-41 before treating this table as a statement about a
+running app.
+
+---
+
+## Part 0.6 — Session 4 audit (2026-08-21): the locked/killed-device path
+
+This session asked one question — *what still works when the phone is locked,
+swiped away, or off?* — and answered it by reading the delivery path end to end.
+Five new bugs came out of it (BUG-37 … BUG-41, in Part 2), one of which is a
+project-level dependency the document had never stated. The table below is the
+answer; read it with those five entries.
+
+### What actually survives a locked or killed device
+
+The honest answer differs per platform and per state.
+
+| State | Message notification | Incoming call rings |
+|---|---|---|
+| App foreground | In-app banner, no tray push (by design, `NotificationManager.ts:116`) | RTDB `incoming/{uid}` pointer — faster than the push |
+| App backgrounded, screen locked | ✅ tray push, both platforms | ✅ Android (data-only wakes the headless task); ⚠️ iOS needs the app still resident |
+| App killed / swiped away | ✅ Android and iOS — the `notification` block means the OS draws it without our JS | ✅ Android from cold (`BackgroundTaskManager.ts:74`); ❌ **iOS — no PushKit VoIP** (BUG-39) |
+| Device powered off | ❌ nothing, by definition. FCM queues within TTL and delivers on next boot; the 45s call TTL (`functions/index.js:39`) will have expired | ❌ |
+
+Two things worth internalising from that table. First, the Android cold-start
+call path is genuinely good and the ordering that makes it work is load-bearing —
+`setBackgroundMessageHandler` must be registered on the first JS tick, which is
+why `BackgroundTaskManager` is imported for side effects from `index.js` and why
+nothing in it may touch React, navigation or the store. Do not "tidy" that
+import. Second, none of the notification column works without Blaze (BUG-41), and
+the call column is additionally gated on BUG-37 (blocking bypass) and BUG-38
+(rejected iOS header). Someone testing on Spark will conclude notifications are
+broken when they are merely absent — which is exactly the kind of wrong diagnosis
+this document exists to prevent.
 
 ---
 
@@ -307,7 +496,7 @@ an error handler that evicts the chat.
 
 ### Found during execution — not in the original list
 
-Added under the Part 8 standing instruction. Each was discovered while fixing
+Added under the Part 9 standing instruction. Each was discovered while fixing
 something else, and each is recorded here before being fixed.
 
 **BUG-30 · P1 · Any uid-holder can read a user's email address.**
@@ -446,6 +635,167 @@ navigator, `useRootNavigationState().key` goes undefined, the gate's own
 `if (!navState?.key) return` then never clears, and the app deadlocks on the
 placeholder. Background only, no spinner: the window is one or two frames and a
 spinner that brief is itself a flicker.
+
+**BUG-37 · P0 · Blocking does not block calls. A blocked user can still ring
+your phone, on the lock screen, from a cold start.**
+BUG-03 closed this for messages and left calls wide open. There are two paths to
+a ring and only one of them is guarded:
+
+- *The push* is guarded. `sendCallInvite` reads `blocks/{calleeId}/{callerId}`
+  (`functions/index.js:248`) and refuses with a deliberately generic message.
+- *The ring pointer* is not. `CallManager.startCall` writes
+  `incoming/{callee}/{callId}` **directly from the client**
+  (`CallManager.ts:175`), before and independently of the callable. The rule at
+  `database.rules.json:448` permits any authenticated user to create that node
+  for anyone as long as `callerId === auth.uid` — it never consults `blocks` or
+  `blockPairs`. `calls/$callId/.write` (`:378`) has the same gap.
+- *The callee's client* does not backstop it either. `handleIncoming`
+  (`CallManager.ts:216`) checks busy state and a stale record, then rings. It
+  never reads `appState.blocked`, even though that map is populated
+  (`StateManager.ts:131`) and the message path *does* check it —
+  `handleForeground` bails on `appState.get().blocked[senderId]`
+  (`NotificationManager.ts:127`). Messages consult the local block list; calls
+  do not.
+
+So the push is silently dropped and the RTDB write rings the phone anyway —
+CallKeep raises the full-screen system call UI over the lock screen, and on a
+killed Android app the data push isn't even needed because the pointer fires as
+soon as the process comes back. The server-side check creates a false sense that
+this is covered.
+
+**Fix, in this order:** (1) guard the `incoming/$uid/$callId` write rule with
+`blockPairs`. The rule cannot call `chatIdFor`, but it does not need to — the
+pair id is a sorted join (`env.ts:76`) so exactly one of two keys can exist, and
+both are cheap to test:
+`!root.child('blockPairs').child(auth.uid + '_' + $uid).hasChildren() && !root.child('blockPairs').child($uid + '_' + auth.uid).hasChildren()`.
+(2) Add the same clause to `calls/$callId/.write`. (3) Add an
+`appState.blocked[invite.callerId]` guard at the top of `handleIncoming` and
+remove the pointer, so a client that somehow receives one still does not ring.
+Rules are the enforcement; the client check is there so the UI never renders a
+call it is about to reject.
+*Found while auditing what survives with the screen locked.*
+
+**BUG-38 · P1 · The iOS call push sends a header combination APNs rejects, and
+the failure can permanently unregister the device.**
+`callPushEnvelope` (`functions/index.js:199-208`) sets
+`'apns-push-type': 'background'` together with `'apns-priority': '10'`. Apple's
+header table allows priority 10 only for alert pushes; a background push must be
+5 (or 1). The documented response is `400 BadPriority`, which means **no iOS
+device is woken for an incoming call** — the invite reaches the callee only if
+their app happens to be alive and the RTDB pointer fires.
+
+The cascade is the worse half. `sendToUser` prunes any token whose error code is
+in `DEAD_TOKEN_CODES` (`:100-104`), and that set includes
+`messaging/invalid-argument` — the code FCM uses for a malformed message. The
+`wholeChunkInvalid` guard (`:155`) suppresses pruning only when *every* token in
+the chunk failed that way, which saves an iOS-only user. It does not save a user
+with an Android phone and an iPad: the Android token succeeds, the chunk is
+mixed, the guard is false, and **the iOS token is deleted from
+`fcmTokens/{uid}`** (`:173`). That device then stops receiving *message* pushes
+too, permanently, until a token refresh happens to re-add it. The multi-device
+token set exists precisely to keep several devices ringing
+(`NotificationManager.ts:43-46`), and this quietly dismantles it one device at a
+time.
+
+**Fix:** send `'apns-priority': '5'` for the background envelope; leave the
+message envelope at 10, where it is correct because that one is
+`apns-push-type: 'alert'` (`:409-410`). Separately, drop
+`messaging/invalid-argument` from `DEAD_TOKEN_CODES` — a payload error is not a
+token verdict, and the existing comment at `:96-99` already admits the code is
+ambiguous. The `wholeChunkInvalid` guard was the right instinct applied at the
+wrong altitude: it tries to infer a bad payload from the response pattern
+instead of not treating a payload error as a dead token in the first place.
+**Verify before shipping:** confirm the exact FCM error code returned for a
+BadPriority rejection against a real iOS token — the priority fix is correct
+regardless, but the pruning cascade depends on that mapping.
+
+**BUG-39 · P1 · On iOS, a killed app cannot ring at all, and the parity table
+says otherwise.**
+Not a regression — a structural gap that is documented in the code and missing
+from this file. `CallKeepService.ts:12-21` states it plainly: CallKit's
+full-screen incoming UI on a terminated app requires a PushKit VoIP push, FCM
+cannot send one, so the callee gets a normal notification they must tap.
+Confirmed from the outside too: `UIBackgroundModes` declares `voip`
+(`app.config.ts:66`), but nothing registers a PushKit token —
+`NotificationManager.start` only calls `registerDeviceForRemoteMessages`
+(`:61`) — and there is no VoIP push dependency in `package.json`. A
+`content-available: 1` background push does not launch a terminated iOS app in
+any case, so BUG-38's header fix is necessary but not sufficient.
+
+The Part 0.5 parity table currently reads "1:1 voice/video calls ✅ WebRTC +
+CallKeep + PiP" with no platform caveat, which overstates it. **Correct the
+table to ⚠️ (Android rings from cold; iOS needs the app alive)** and treat the
+VoIP transport as its own work item: an Apple VoIP key, pushes sent straight to
+APNs rather than through FCM, plus `react-native-voip-push-notification`. Note
+that iOS 13+ *requires* reporting a CallKit call on every VoIP push received —
+so the handler cannot decide not to ring, and a push for an already-cancelled
+call must still present and then immediately end, or iOS stops delivering VoIP
+pushes to the app.
+
+**BUG-40 · P2 · Every message notification names an Android channel that does
+not exist.**
+`onMessageWritten` sets `android.notification.channelId: 'messages'`
+(`functions/index.js:402`) and `onReactionCreated` the same (`:500`). Nothing
+creates that channel. Grepping the client for channel creation finds exactly one
+id, `com.flyer.chat.calls`, created by CallKeep's foreground-service config
+(`CallKeepService.ts:88`). So every message and reaction push lands on FCM's
+auto-created fallback channel at default importance: no heads-up banner while
+the phone is unlocked, no per-channel sound, and nothing for the user to tune in
+Android settings. The per-chat `tag` still works, so replacement behaviour is
+unaffected.
+
+This is *half* recorded already — Part 4's `ensureChannels()` entry explains why
+the empty stub was deleted and argues real channels deserve a designed feature.
+What it does not record is that the functions still name `'messages'`, so the
+two halves of the decision disagree: the server behaves as though channels exist
+and the client guarantees they do not. **Fix:** either drop the `channelId` keys
+so the fallback is explicit rather than accidental, or create the channel set —
+but do not leave the payload asserting something untrue. If channels do get
+built, `messages` and the existing calls channel should be designed together
+with the mute UI, per that Part 4 entry.
+
+**BUG-41 · P0 · Everything in Part 2's notification and call work is undeployable
+on the Spark plan, and one security fix put user discovery behind that paywall.**
+Not a code defect — a dependency the document never states, which makes several
+"fixed" entries conditional. Every function in `functions/index.js` is Cloud
+Functions **v2** (`onCall`, `onValueCreated`, `onValueUpdated`, `onSchedule` via
+`firebase-functions/v2`, `:21-25`), which builds on Cloud Run, Artifact Registry
+and Cloud Build; `reapStaleCalls` (`:614`) additionally needs Cloud Scheduler,
+and `smartReply` (`:858`) needs Secret Manager for `MISTRAL_API_KEY` (`:74`).
+None of those APIs can be enabled on a project without a billing account, so on
+Spark the deploy fails before any code runs.
+
+What that actually costs, by reading the call sites:
+
+- No message or reaction pushes at all — `onMessageWritten` is the only sender.
+- No call invite or cancel push, so BUG-38 and BUG-39 are moot until billing
+  exists; incoming calls work only while the callee's app is alive and the RTDB
+  pointer fires.
+- No call history for either side. `callHistory` is admin-written by design
+  (`database.rules.json:461-466` — the client `.write` is delete-only), so the
+  history screen stays permanently empty rather than degrading.
+- No stale-call reaping, so a caller who dies mid-ring leaves `calls/{id}/state`
+  at `ringing` forever.
+- **No user discovery whatsoever.** This is the sharp one. BUG-04's fix deleted
+  `fetchAllUsers` and removed parent `.read` from `users` and `usernames`, so
+  the client *cannot* search even in principle; `DirectoryService` is "the only
+  way in" by its own comment (`DirectoryService.ts:11-12`) and it does nothing
+  but invoke the `searchUsers` callable (`:86`). Add-contact, add-by-email and
+  new-group member search all dead-end. A security fix moved a core user-facing
+  feature behind a paid dependency with no client-side fallback, and nothing
+  recorded the coupling.
+
+**Fix / decision to make explicitly, like S-01:** Blaze with a budget alert and
+`maxInstances` already set (`:35`) is the intended path, and the functions free
+tier means a small project typically bills nothing — the requirement is a card
+on file, not a cost. Write the decision down either way. If Spark has to hold
+for now, the honest mitigation is to degrade loudly rather than silently: have
+`DirectoryService` surface "search is unavailable" on `functions/not-found`
+instead of rendering an empty result that looks like "no such user", and hide the
+call-history tab rather than showing a permanently empty list. **Verify at
+deploy:** confirm the current Blaze requirement against
+`firebase.google.com/pricing` before acting on this entry — plan gating has
+changed over time, and this session could not check it live.
 
 ---
 
@@ -723,28 +1073,323 @@ single feature in Part 3.
 
 ---
 
-## Part 8 — Execution order
+## Part 8 — Notification and call reliability ("WhatsApp level")
+
+Part 3 is about *features* Flyer lacks. This part is about the delivery layer:
+why a message that WhatsApp would have shown instantly, on the lock screen, with
+the sender's photo and a reply box, currently shows up as a plain replaced banner
+— or not at all. None of it is user-visible as a feature; all of it is what makes
+people trust a messenger enough to switch.
+
+Ordered by "how many missed notifications does this cause", worst first. Verified
+against source the same way Part 2 is. Where a claim is about OS behaviour rather
+than this codebase it is marked **[device-verify]** — those need a real handset or
+a deploy to confirm, and must not be treated as established.
+
+### The one that matters more than the rest combined
+
+**N-01 · P0 · Nothing handles OEM battery killers, which is the dominant cause of
+missed notifications on the phones this app is most likely to run on.**
+Grepping the whole repo for battery-optimisation handling finds nothing:
+no `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`, no autostart education, no
+`isIgnoringBatteryOptimizations` check. `withFlyerCallKeep.js:27-49` declares 15
+permissions and none is this one.
+
+Why it dominates: Xiaomi (MIUI), Oppo/Realme (ColorOS), Vivo (Funtouch) and
+Transsion (Tecno/Infinix) all kill background processes and revoke FCM wake-ups
+far more aggressively than stock Android, and several require *manual* per-app
+"Autostart" and "No battery restriction" toggles that no API can set. Widely used
+apps tend to fare better on these ROMs — whether through vendor allowlists or
+simply because users grant them the toggles — while a newly installed unknown app
+gets the full restriction. The observable symptom is exactly the complaint that
+makes people abandon a messenger — "messages only arrive when I open the app" —
+and it will read as an FCM bug or a code bug when it is neither. On the likely
+user base for this app (the same audience F-29's RTL work targets) this is not an
+edge case, it is the common case. **[device-verify]** for the per-OEM specifics,
+which change between ROM versions and are the part most likely to be stale.
+
+**Fix, in the order that pays off:** (1) On first launch after notification
+permission is granted, check `isIgnoringBatteryOptimizations`; if false, show a
+one-screen explainer and fire the
+`ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` intent. (2) Detect the
+manufacturer and deep-link into the OEM's own autostart screen — the intents are
+well-documented per ROM and a generic "open settings" is useless here because
+the toggle is four levels deep. (3) Add a diagnostic screen the user can be
+pointed at from support: notification permission, battery-optimisation state,
+whether an FCM token exists, and last push received. (4) Re-check on app
+foreground after an OS update, which silently re-restricts on some ROMs. Do not
+implement (1) as a blocking gate — a permission wall on first run costs more
+installs than it saves notifications.
+
+**On the dependency question (Part 0 rule 7):** none of these APIs is reachable
+from the current dependency set — `PermissionManager` covers only runtime
+permissions and there is no intent-launcher package in `package.json`. So this
+needs either a new dependency or a small native module. `package.json` already
+declares `expo.autolinking.nativeModulesDir: './modules'` (`:73-77`), so a local
+module is the cheaper option and keeps a single narrow surface (three methods:
+is-exempt, request-exemption, open-OEM-settings) rather than pulling a library for
+it. State whichever choice you make and why, per rule 7.
+
+### Delivery correctness
+
+**N-02 · P1 · There is no "delivered" state at all, so a message stays on one
+tick until the recipient opens the app.**
+`Message` carries `seenBy` and nothing else (`types.ts:92`), and `Ticks.tsx:52`
+renders exactly two states: `check` when unseen, `doubleCheck` tinted when seen.
+The comment at `Ticks.tsx:58-59` says "when a message flips from delivered to
+seen", but no delivered state exists — the codebase's own comment describes a
+model it does not implement. Meanwhile `BackgroundTaskManager`'s message branch
+is an explicit no-op (`:91-94`, "the system tray draws them without our
+involvement. Nothing to do here").
+
+That no-op is the gap. WhatsApp's second tick means *the device received it*, and
+it appears while the app is closed, because the push itself is the delivery
+signal. Flyer cannot distinguish "their phone is off" from "they have not looked
+yet", which is the single most-read piece of information in a chat UI.
+
+**Fix:** in the background handler's `message` case, write
+`messages/{chatId}/{messageId}/deliveredTo/{myUid}: true` before returning — the
+handler is already async and Android keeps the headless task alive until the
+promise settles. The rule is a direct copy of `seenBy`'s
+(`database.rules.json:272-277`), which already restricts each uid to writing only
+its own key and requires chat membership — so this is a new node in a proven
+shape, not a new rule pattern. Then make `Ticks` three-state.
+
+Two caveats. On iOS the background handler runs only for pushes that reach a
+live-enough app, so iOS delivery marks will be less reliable than Android until
+N-05 lands — acceptable, since a missing second tick reads as "not yet
+delivered", which is the safe direction to be wrong in. And this adds one write
+per recipient per message, so it belongs *after* BUG-08 moves unread accounting
+server-side, not before.
+
+Also note the constraint `markChatRead` documents (`ChatEngine.ts:937-940`): it
+clears unread without touching `seenBy`, because a receipt should only turn blue
+when the message was actually on screen. `deliveredTo` is the opposite — it is
+exactly the signal that is legitimate to set without the user having looked. That
+distinction is the whole reason the third state is worth having.
+
+**N-03 · P1 · Multiple messages from one chat collapse into one notification that
+shows only the newest, with no count.**
+`android.notification.tag: chatId` (`functions/index.js:404`) makes each new push
+replace the previous one for that chat — the comment says so deliberately: "One
+live notification per chat: a newer message replaces the older." Ten messages
+while the phone is on a table produce one banner showing the tenth, and no
+indication the other nine exist. iOS is better by accident: `thread-id`
+(`:414`) groups rather than replaces.
+
+WhatsApp uses Android's `MessagingStyle` — one notification per chat that
+*accumulates* lines, shows the count, and renders each sender's avatar — plus a
+group summary across chats. The replacement behaviour was the right call given
+the tools available (FCM's `notification` block cannot express MessagingStyle),
+but it is the wrong end state.
+
+**Fix:** this is the item that forces the architectural decision in N-06. A
+server-composed `notification` block can never do MessagingStyle; it requires
+building the notification on-device from a data-only push. Until then there is a
+genuinely free mitigation: the count is *already in hand*. `unread` lives at
+`chats/{chatId}/unread/{uid}` (`FirebaseService.ts:106`) and `onMessageWritten`
+has already read the whole chat node into `chat` (`functions/index.js:352`), so
+`(chat.unread || {})[uid]` costs nothing extra — put it in the body so the single
+banner at least says "3 new messages". Do this even if N-06 lands on
+server-composed and MessagingStyle never happens.
+
+**N-04 · P1 · A missed call produces no notification.**
+`onCallStateChanged` (`functions/index.js:523`) writes `callHistory` for both
+sides and clears the ring pointer, and sends no push. `reapStaleCalls` (`:614`)
+re-enters the same function, so a caller who vanished mid-ring produces no
+notification either. On Android CallKeep reports the call to the system call log,
+and on iOS CallKit puts it in Recents **[device-verify]** — but there is nothing
+in the notification tray, so a user who missed a call while the phone was locked
+has no indication on their lock screen that anyone rang. WhatsApp shows a
+persistent "Missed voice call" notification that deep-links to the caller.
+
+**Fix:** in `onCallStateChanged`, when `missed` is true and `after === 'ended'`,
+push an alert to the callee tagged `call:{peerId}` with a `kind: 'missed_call'`
+data payload, and route it in `handleTap` (`NotificationManager.ts:141`) to the
+caller's chat rather than `/call` — which is the wrong destination for a call
+that is over. Respect the same mute and block checks the message path uses.
+Suppress it when `endedReason` is `rejected` or `busy`: the user chose those, and
+WhatsApp does not notify you about a call you declined.
+
+**N-05 · P1 · iOS message pushes are not marked time-sensitive and carry no
+badge, so they lose to Focus mode and the app icon never shows a count.**
+The APNs payload for messages (`functions/index.js:407-419`) sets `thread-id` and
+`sound` and nothing else. Two consequences. First, no `interruption-level:
+'time-sensitive'`, so with Focus or a Sleep schedule on, message notifications
+are held silently — WhatsApp marks conversation notifications time-sensitive
+specifically so they break through, which is why WhatsApp wakes you and Flyer
+would not. Second, no `aps.badge`, so the iOS app-icon badge never appears. The
+in-app badge is fully implemented (`(tabs)/_layout.tsx:54` drives it from
+`totalUnread`), so the app knows the number and simply never tells the OS.
+`PermissionManager` even requests the badge permission (`:64`) and then nothing
+uses it. **[device-verify]** for Focus-mode behaviour.
+
+**Fix:** add `'interruption-level': 'time-sensitive'` to the message and reaction
+payloads (calls do not need it — CallKit outranks Focus). For the badge, the
+function already computes per-recipient state, so read the recipient's total
+unread and set `aps.badge` to it; note this must be the *total across all chats*,
+not the per-chat count, or the icon will read wrong. Clear it on read by sending
+`badge: 0` — or better, set the badge from the client on foreground, since the
+client already has `totalUnread` and does not need a round trip.
+
+### The architectural decision this all depends on
+
+**N-06 · P1 · Decide explicitly: server-composed `notification` pushes, or
+data-only pushes with the notification built on-device.**
+Right now message pushes carry a `notification` block (`functions/index.js:392`)
+and call pushes are data-only (`:193-197`), and each choice is right for its
+case and documented as such. The problem is that N-03 (MessagingStyle), the
+direct-reply and mark-as-read actions in N-07, per-message avatars, and any
+lock-screen privacy control **all require building the notification in JS**,
+which means data-only for messages too. That is a real trade, not a free upgrade:
+
+- *Server-composed (today).* The OS draws it even if JS never runs. Survives
+  battery killers better, because nothing needs to wake. Cannot do MessagingStyle,
+  actions, or avatars.
+- *Data-only + on-device compose.* Full control. But it puts a JS wake-up on the
+  critical path for **every message**, so N-01's battery killers now cause
+  *silently missing* notifications rather than merely un-tuned ones, and on iOS a
+  data-only message push is throttled and will not reliably run at all — iOS needs
+  a Notification Service Extension to mutate a real alert push instead.
+
+**Recommendation, stated so it can be argued with:** keep server-composed pushes
+as the floor that always works, and treat on-device composition as an Android-only
+enhancement layered on top — Android gets data-only with a `notification` fallback
+in the same message, so if JS is killed the OS still draws something. iOS gets
+alert pushes plus a Notification Service Extension when N-08 is done. Do **not**
+go data-only-everywhere on the strength of N-03 alone; that trades a cosmetic
+problem for a delivery problem, on the exact devices least able to absorb it.
+This decision gates N-03, N-07 and N-08 — settle it before writing any of them.
+
+### Interaction quality
+
+**N-07 · P2 · No notification actions: no direct reply, no mark-as-read.**
+Nothing in the repo creates notification actions, and it cannot — FCM's
+`notification` block has no action support, and there is no `notifee` or
+`expo-notifications` dependency (`package.json:20-64`). Replying to a message
+therefore always costs a full app open. WhatsApp's inline reply is one of the
+most-used affordances in the product, and mark-as-read from the tray is how
+people clear a chat they do not need to answer.
+
+**Fix:** blocked on N-06. Once on-device composition exists on Android, add a
+`RemoteInput` reply action wired to the existing send path and a mark-as-read
+action calling the existing `markChatRead` (`ChatEngine.ts:942`, which already
+clears unread without opening the chat — exactly the primitive needed, and its
+deliberate choice not to touch `seenBy` is the right semantics here too: clearing
+from the tray should not claim you read the messages). Reply from a notification
+must go through `OfflineQueue`, not a direct write: the device is very likely on a
+bad connection if the user is answering from the tray.
+
+**N-08 · P2 · iOS notifications show no sender photo (no communication
+notifications), and Android shows no avatar either.**
+On iOS 15+, showing the sender's photo and name in the notification requires
+donating an `INSendMessageIntent` and the Communication Notifications
+entitlement; neither appears in `app.config.ts` (entitlements are just
+`aps-environment`, `:76-78`). On Android an avatar requires a `Person` in
+MessagingStyle, which is blocked on N-06. So every notification is anonymous
+chrome with a name in text — the most visible cosmetic difference from WhatsApp
+on a lock screen. Also worth noting: `photoURL` is already in the push path for
+calls (`functions/index.js:266`) and respects `privacy.showPhoto`, so the privacy
+model for this is already settled — it just is not sent for messages.
+
+**Fix:** iOS needs the entitlement, an intent donation on send, and a Notification
+Service Extension to attach the image (the extension is also what N-05's richer
+payloads and any future E2E-decrypt-in-notification work would use, so it is
+worth building once). Android is downstream of N-06. Respect
+`privacy.showPhoto === false` on both, matching the call path.
+
+**N-09 · P2 · The incoming-call vibration is applied twice on Android.**
+`handleIncoming` runs `Vibration.vibrate([0, 500, 1000], true)`
+(`CallManager.ts:282-284`) while CallKeep's ConnectionService is already ringing
+the call with the system ringtone and its own vibration — `selfManaged: false`
+(`CallKeepService.ts:95`) hands ring behaviour to the OS precisely so it matches
+a real phone call. The two are independent, so the phone buzzes on two schedules.
+Note it only happens on the *pointer* path: a call that arrives via the FCM
+background handler goes through `BackgroundTaskManager.handleCallPush` (`:46`),
+which does not vibrate — so the same incoming call feels different depending on
+whether the app was alive, which is the tell that one of the two is wrong.
+**[device-verify]** — whether the OEM ring vibration is actually present varies,
+and on a ROM that suppresses it the manual call may be masking the gap.
+
+**Fix:** delete the manual `Vibration.vibrate` and the `Vibration.cancel()` calls
+that pair with it (`:310`, `:353`, `:571`), and let the ConnectionService own
+ringing. If a ROM turns out not to vibrate, add it back *in one place* behind an
+explicit flag, on both paths rather than one.
+
+**N-10 · P3 · No lock-screen privacy control for message previews.**
+The push always contains the sender's name and a 120-character preview
+(`functions/index.js:329`), and nothing sets Android `visibility` or offers a
+"hide preview" setting. Anyone glancing at a locked phone reads the message.
+WhatsApp exposes this as a per-account setting. Low severity because the default
+matches WhatsApp's default; it is the *absence of the choice* that is the gap.
+**Fix:** downstream of N-06 on Android (`VISIBILITY_PRIVATE` plus a redacted
+public version). Server-side it is simpler: a `privacy.hidePreview` flag the
+function honours by sending a bare "New message" body — worth doing on its own,
+since it works with today's architecture and needs no client notification work.
+
+### Ship order
+
+N-01 first and alone — it is worth more than everything below it combined, it
+needs no architectural decision, and it is the difference between "notifications
+work" and "notifications sometimes work". Then N-02 and N-04 (both small,
+server-side, immediately visible). Then settle **N-06**, because N-03, N-07, N-08
+and N-10 are all blocked on it and building any of them first commits the
+decision by accident. N-05 can land any time; it is two payload keys and the
+badge. N-09 whenever the call path is next open.
+
+Prerequisites from elsewhere in this document: all of it needs BUG-41 (Blaze)
+resolved, since every push originates in a Cloud Function. N-02 should follow
+BUG-08. Fix BUG-38 before measuring anything on iOS, or the results will be
+noise. And N-03's server-side mitigation reads `unread`, which BUG-08 is about to
+move — sequence them together.
+
+---
+
+## Part 9 — Execution order
 
 Do not attempt this in one pass. Stop after each numbered step.
 
 1. **Verify BUG-01 and BUG-02**, then stand up the emulator and write rules tests
    pinning them. This is H-03's first deliverable and makes everything after it
    safer.
-2. **Remaining P0s** — BUG-03 … BUG-07. All security or correctness. Ship.
-3. **Notification PR** — BUG-20 … BUG-24 together. Best effort-to-payoff ratio in
-   this document.
+1.5. **Settle BUG-41 (Blaze) before anything below it.** It is not code, it is a
+   precondition: steps 2, 3 and 4 all touch `functions/index.js` or depend on a
+   deployed function, and none of it can be tested end to end on Spark. Decide,
+   write the decision down, then continue.
+2. **Remaining P0s** — BUG-03 … BUG-07, plus **BUG-37** (blocking bypasses calls,
+   which belongs with BUG-03 — same feature, same rules file, and the fix is one
+   clause in two rules). All security or correctness. Ship.
+3. **Notification PR** — BUG-20 … BUG-24 together, now with **BUG-38** and
+   **BUG-40** (both are `functions/index.js` payload shape — same file, same
+   review). Add **N-05** here too: it is two payload keys plus the badge, in the
+   same function. Best effort-to-payoff ratio in this document.
+3.5. **N-01 (OEM battery killers).** Out of numeric order on purpose. It is worth
+   more than everything else in Part 8 combined, it is client-only so it does not
+   wait on Blaze, and until it is done any measurement of notification
+   reliability on a Xiaomi/Oppo/Vivo handset is measuring the ROM, not the app.
 4. **Data-integrity rules PR** — BUG-25 … BUG-29, with a rules test per fix.
 5. **H-01, H-02, H-04** (App Check, Crashlytics, CI). Before growing the user
    base — App Check retrofits badly.
 6. **Refactor `app/chat/[chatId].tsx`** into components. Before Tier-1 features.
-7. **P1 correctness** — BUG-08 … BUG-19.
+7. **P1 correctness** — BUG-08 … BUG-19, then **N-02** (delivered ticks) and
+   **N-04** (missed-call notification) — N-02 must follow BUG-08, which moves the
+   unread accounting it would otherwise contend with.
+7.5. **Settle N-06** (server-composed vs on-device notifications). N-03, N-07,
+   N-08 and N-10 are all blocked on it, and implementing any of them first
+   commits the decision by accident. Write the decision down like S-01.
 8. **Tier 1 features** — F-01 … F-10, in order.
 9. **Decide S-01 explicitly** (RTDB vs Firestore). Write down the decision and the
    reasoning even if the answer is "stay".
 10. **Decide F-21 explicitly** (E2E). It gets more expensive with every feature
     added first, because search, notifications, and smart replies all change
-    around it.
-11. Tier 2 → Part 6 performance work → Tier 3 → Part 7.
+    around it. Note it also interacts with Part 8: an E2E payload cannot carry a
+    preview, so N-03's body text and N-08's avatars both have to move on-device.
+10.5. **BUG-39 (iOS VoIP push)** — its own project, not a patch. Needed before any
+    iOS release where calling is advertised; skippable indefinitely on an
+    Android-first build, which is what `app.config.ts` currently describes. Pair
+    with **N-08**'s Notification Service Extension: both are iOS-native work and
+    the extension is reusable.
+11. Tier 2 → Part 6 performance work → rest of Part 8 → Tier 3 → Part 7.
 
 ### Reporting contract
 

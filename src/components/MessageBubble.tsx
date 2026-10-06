@@ -197,6 +197,8 @@ function MessageBubbleImpl({
       {message.replyTo ? (
         <Pressable
           onPress={() => onPressReply(message.replyTo!.messageId)}
+          accessibilityRole="button"
+          accessibilityLabel="Go to quoted message"
           style={[
             styles.replyBox,
             {
@@ -304,6 +306,8 @@ function MessageBubbleImpl({
             mine ? styles.reactionsMine : styles.reactionsTheirs,
             { backgroundColor: theme.colors.bgElevated, borderColor: theme.colors.border },
           ]}
+          accessible
+          accessibilityLabel={`Reactions: ${reactions.map(([emoji, count]) => `${emoji} ${count}`).join(', ')}`}
         >
           {reactions.map(([emoji, count]) => (
             <Text key={emoji} style={styles.reactionText}>
@@ -333,19 +337,32 @@ export const MessageBubble = memo(MessageBubbleImpl, (prev, next) => {
   return (
     a.id === b.id &&
     a.text === b.text &&
+    a.type === b.type &&
     a.mediaUrl === b.mediaUrl &&
     a.thumbUrl === b.thumbUrl &&
+    // Late-arriving metadata resizes the bubble and fills the meta row: without
+    // these the upload placeholder keeps its guessed aspect forever.
+    a.width === b.width &&
+    a.height === b.height &&
+    a.durationMs === b.durationMs &&
+    a.forwardedFrom === b.forwardedFrom &&
+    a.replyTo?.messageId === b.replyTo?.messageId &&
     a.deleted === b.deleted &&
     a.edited === b.edited &&
     a.pending === b.pending &&
     a.failed === b.failed &&
     a.timestamp === b.timestamp &&
     JSON.stringify(a.seenBy) === JSON.stringify(b.seenBy) &&
+    JSON.stringify(a.deliveredTo ?? {}) === JSON.stringify(b.deliveredTo ?? {}) &&
     JSON.stringify(a.reactions) === JSON.stringify(b.reactions) &&
     prev.showTail === next.showTail &&
     prev.starred === next.starred &&
     prev.mine === next.mine &&
+    prev.peerUid === next.peerUid &&
+    // Identity is enough: the parent memoises the recipient list per membership.
+    prev.recipients === next.recipients &&
     prev.sender?.name === next.sender?.name &&
+    prev.replyToSender?.name === next.replyToSender?.name &&
     prev.showSenderName === next.showSenderName &&
     // Not a rendered value, but entering and leaving selection mode changes what
     // a tap does. Comparing presence rather than identity keeps the memo useful:

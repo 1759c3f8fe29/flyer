@@ -1,4 +1,4 @@
-import React, { useCallback, useMemo, useRef } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef } from 'react';
 import { Animated, StyleSheet, useWindowDimensions, View } from 'react-native';
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import * as Haptics from 'expo-haptics';
@@ -68,6 +68,15 @@ export function DraggablePiP({
   // gesture needs its own record of where it started from.
   const settled = useRef({ x: home.x, y: home.y });
   const dragged = useRef(false);
+
+  // Corners move with rotation and insets; without this a rotated tile keeps
+  // its portrait coordinates and can end up half off-screen. Skipped mid-drag
+  // so a rotation does not yank the tile out from under the finger.
+  useEffect(() => {
+    if (dragged.current) return;
+    position.setValue(corners[0]);
+    settled.current = corners[0];
+  }, [corners, position]);
 
   const snap = useCallback(
     (x: number, y: number) => {

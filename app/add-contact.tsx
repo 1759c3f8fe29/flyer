@@ -22,23 +22,21 @@ import {
   sendRequest,
   type RelationshipState,
 } from '@/src/services/ContactService';
-import {
-  SEARCH_MIN_PREFIX,
-  findUserByEmail,
-  hitToPartial,
-  searchDirectory,
-  type SearchHit,
-} from '@/src/services/DirectoryService';
+import { findUserByEmail, hitToPartial, type SearchHit } from '@/src/services/DirectoryService';
 import { useAppStore } from '@/src/services/StateManager';
+import { findUserByUsername, validateUsername } from '@/src/services/UsernameService';
 
 type Mode = 'username' | 'email';
 
 /**
- * Add a contact by username or by exact email address.
+ * Add a contact by exact username or by exact email address.
  *
- * The two modes are deliberately asymmetric. Username is a prefix search,
- * because a handle is an identifier people choose precisely so they can be
- * found. Email is exact-match only: a prefix search over addresses would let
+ * Both modes resolve an identifier you already know; neither searches. Username
+ * used to be a prefix search over `usernames`, but a prefix range and full
+ * enumeration share one RTDB permission, so that had to move to the
+ * `searchUsers` callable. This screen resolves a full `@username` instead via
+ * `findUserByUsername`, which reads `usernames/{handle}` per-row and is still
+ * permitted. Email is exact-match only: a prefix search over addresses would let
  * anyone enumerate every account one letter at a time, and you are expected to
  * already know the address — the same bar as knowing someone's phone number.
  */
@@ -92,15 +90,19 @@ export default function AddContactScreen() {
     }
   }, [query, myUid, searching, mergeUser]);
 
-  // Usernames search as you type; email waits for submit because an exact match
-  // on a half-typed address is never going to hit.
+  // Usernames resolve by exact handle; email waits for submit because an exact
+  // match on a half-typed address is never going to hit.
   useEffect(() => {
     if (mode !== 'username') return;
 
     const needle = query.trim().replace(/^@/, '').toLowerCase();
-    // The server ignores anything shorter, so asking would render "no results"
-    // for a search that never ran.
-    if (needle.length < SEARCH_MIN_PREFIX || !myUid) {
+    // Only fire once the query is a well-formed handle. Anything shorter or
+    // malformed can never resolve, so reading it would just return null.
+    if (!needle || !myUid || validateUsername(needle)) {
+      // Invalidate any in-flight lookup: without the bump, clearing the query
+      // does not retire its ticket, and the stale promise repopulates results
+      // after the clear. (The pending timer is cleared by the effect cleanup.)
+      seq.current += 1;
       setResults([]);
       setNotFound(false);
       setSearching(false);
@@ -111,14 +113,31 @@ export default function AddContactScreen() {
     setSearching(true);
     const timer = setTimeout(async () => {
       try {
-        const found = await searchDirectory(needle);
+        const profile = await findUserByUsername(needle, myUid);
         if (ticket !== seq.current) return;
-        setResults(found);
-        setNotFound(found.length === 0);
-        found.forEach((hit) => mergeUser(hitToPartial(hit)));
+        if (profile) {
+          const hit: SearchHit = {
+            uid: profile.uid,
+            name: profile.name,
+            username: profile.username,
+            // The callable's searchProjection withheld the photo when a profile
+            // set showPhoto:false; a direct users/{uid} read returns it verbatim,
+            // so honour that choice here instead of leaking the hidden URL.
+            photoURL: profile.privacy?.showPhoto === false ? null : profile.photoURL,
+            // A handle result never carries an email for the same reason the old
+            // callable withheld it: lookup must not become a harvester.
+            email: null,
+          };
+          setResults([hit]);
+          setNotFound(false);
+          mergeUser(hitToPartial(hit));
+        } else {
+          setResults([]);
+          setNotFound(true);
+        }
       } catch (e) {
         if (ticket !== seq.current) return;
-        console.warn('[Flyer/add-contact] username search failed', e);
+        console.warn('[Flyer/add-contact] username lookup failed', e);
         setResults([]);
       } finally {
         if (ticket === seq.current) setSearching(false);
@@ -212,7 +231,7 @@ export default function AddContactScreen() {
 
         <Text style={[styles.label, { color: theme.colors.textMuted }]}>
           {mode === 'username'
-            ? `Search for someone by their @username — at least ${SEARCH_MIN_PREFIX} characters.`
+            ? 'Search for someone by their full @username.'
             : 'Enter the exact email address of the person you want to add.'}
         </Text>
 
@@ -277,7 +296,7 @@ export default function AddContactScreen() {
             <Icon name="info" size={18} color={theme.colors.textMuted} />
             <Text style={[styles.noteText, { color: theme.colors.textMuted }]}>
               {mode === 'username'
-                ? 'No usernames start with that.'
+                ? 'No Flyer account uses that username.'
                 : 'No Flyer account uses that email address.'}
             </Text>
           </View>

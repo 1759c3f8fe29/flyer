@@ -59,6 +59,8 @@ export interface PrivacySettings {
   showAbout: boolean;
   /** Read receipts are mutual: disabling also hides other people's from you. */
   readReceipts: boolean;
+  /** N-10: lock-screen pushes carry "New message" instead of the preview. */
+  hidePreview: boolean;
 }
 
 export const DEFAULT_PRIVACY: PrivacySettings = {
@@ -66,6 +68,7 @@ export const DEFAULT_PRIVACY: PrivacySettings = {
   showPhoto: true,
   showAbout: true,
   readReceipts: true,
+  hidePreview: false,
 };
 
 export interface ReplyRef {
@@ -90,6 +93,8 @@ export interface Message {
   durationMs: number | null;
   timestamp: number;
   seenBy: Record<string, number>;
+  /** N-02: uid -> server ms when that device received the push (2nd tick). */
+  deliveredTo: Record<string, number>;
   edited: boolean;
   deleted: boolean;
   reactions: Record<string, string>;
@@ -214,9 +219,11 @@ export interface StarredRef {
 export interface QueuedSend {
   id: string;
   chatId: string;
-  draft: Omit<Message, 'id' | 'chatId' | 'timestamp' | 'seenBy'>;
+  draft: Omit<Message, 'id' | 'chatId' | 'timestamp' | 'seenBy' | 'deliveredTo'>;
   /** Local file uri that still needs uploading, if any. */
   localUri: string | null;
   attempts: number;
+  /** Earliest server-ms to retry after a failure (backoff). Absent = due. */
+  nextRetryAt?: number;
   queuedAt: number;
 }

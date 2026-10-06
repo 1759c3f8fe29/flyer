@@ -22,12 +22,14 @@ import {
   readOnce,
   ref,
   remove,
+  serverNow,
   serverTimestamp,
   update,
   write,
   type Unsubscribe,
 } from './FirebaseService';
 import {
+  clearQueueForChat,
   enqueue,
   pendingFor,
   registerSender,
@@ -66,6 +68,7 @@ function normaliseMessage(id: string, chatId: string, raw: Record<string, unknow
     durationMs: (raw.durationMs as number | null) ?? null,
     timestamp: (raw.timestamp as number) ?? 0,
     seenBy: (raw.seenBy as Record<string, number>) ?? {},
+    deliveredTo: (raw.deliveredTo as Record<string, number>) ?? {},
     edited: Boolean(raw.edited),
     deleted: Boolean(raw.deleted),
     reactions: (raw.reactions as Record<string, string>) ?? {},
@@ -229,6 +232,7 @@ export function listenToMessages(chatId: string, uid: string): Unsubscribe {
       chatId,
       timestamp: q.queuedAt,
       seenBy: {},
+      deliveredTo: {},
       pending: true,
     }));
 
@@ -267,12 +271,25 @@ export function listenToMessages(chatId: string, uid: string): Unsubscribe {
  * loses a message, and no amount of further scrolling brings it back.
  *
  * Inclusive means the caller gets back rows it already has, so one extra row is
- * requested to keep a full page of new ones, and the caller de-duplicates by id.
+ * requested to keep a full page of new ones, and the overlap is removed here —
+ * not in the caller. The dedupe used to live in the chat screen, so every
+ * future caller had to remember it or render doubles (BUG-17).
  */
+/** One-shot read of a single message, for screens the live listener never fed. */
+export async function readMessage(
+  chatId: string,
+  messageId: string
+): Promise<Message | null> {
+  const raw = await readOnce<Record<string, unknown>>(Paths.message(chatId, messageId));
+  if (!raw) return null;
+  return normaliseMessage(messageId, chatId, raw);
+}
+
 export async function loadOlderMessages(
   chatId: string,
   before: number,
-  uid: string
+  uid: string,
+  excludeIds: Set<string> = new Set()
 ): Promise<Message[]> {
   const snap = await ref(Paths.messages(chatId))
     .orderByChild('timestamp')
@@ -285,6 +302,7 @@ export async function loadOlderMessages(
 
   return Object.entries(raw)
     .map(([id, value]) => normaliseMessage(id, chatId, value))
+    .filter((m) => !excludeIds.has(m.id))
     .filter((m) => m.timestamp > clearedAt)
     .filter((m) => !m.hiddenFor[uid])
     .sort((a, b) => a.timestamp - b.timestamp);
@@ -421,6 +439,7 @@ async function commitMessage(opts: SendOptions, messageId: string): Promise<void
     durationMs: opts.durationMs ?? null,
     timestamp: serverTimestamp(),
     seenBy: { [senderId]: serverTimestamp() },
+    deliveredTo: {},
     edited: false,
     deleted: false,
     reactions: {},
@@ -494,7 +513,7 @@ export async function sendText(
       },
       localUri: null,
       attempts: 0,
-      queuedAt: Date.now(),
+      queuedAt: serverNow(),
     });
     return;
   }
@@ -548,8 +567,9 @@ export async function sendMedia(
     ...(draft as unknown as Message),
     id: messageId,
     chatId,
-    timestamp: Date.now(),
+    timestamp: serverNow(),
     seenBy: {},
+    deliveredTo: {},
     pending: true,
   });
 
@@ -560,7 +580,7 @@ export async function sendMedia(
       draft,
       localUri: media.uri,
       attempts: 0,
-      queuedAt: Date.now(),
+      queuedAt: serverNow(),
     });
     return;
   }
@@ -586,13 +606,26 @@ export async function sendMedia(
       messageId
     );
   } catch (e) {
+    // The log used to say "queueing" while queueing nothing: an upload that
+    // fails mid-flight (offline flip, Cloudinary 5xx) marked the bubble failed
+    // and rethrew, so unlike the offline branch it never retried on reconnect.
+    // The draft keeps the *local* uri, so the replay path re-uploads it.
     console.warn('[Flyer/chat] media send failed, queueing', e);
+    await enqueue({
+      id: messageId,
+      chatId,
+      draft,
+      localUri: media.uri,
+      attempts: 0,
+      queuedAt: serverNow(),
+    });
     appState.get().upsertMessage(chatId, {
       ...(draft as unknown as Message),
       id: messageId,
       chatId,
-      timestamp: Date.now(),
+      timestamp: serverNow(),
       seenBy: {},
+      deliveredTo: {},
       pending: false,
       failed: true,
     });
@@ -642,6 +675,15 @@ registerSender(async (item: QueuedSend) => {
 
 // --- mutations -----------------------------------------------------------
 
+/**
+ * BUG-10 windows, mirrored in database.rules.json (`text`/`edited` vs
+ * `deleted`). WhatsApp's caps: edits 15 minutes, delete-for-everyone ~2 days.
+ * The UI hides the actions past expiry; the rules enforce it server-side
+ * against the message's own `timestamp`, so a tampered client is denied.
+ */
+export const EDIT_WINDOW_MS = 15 * 60 * 1000;
+export const DELETE_WINDOW_MS = 2 * 24 * 60 * 60 * 1000;
+
 export async function editMessage(
   chatId: string,
   messageId: string,
@@ -669,6 +711,9 @@ export async function editMessage(
  * gets a permission error rather than a wiped message.
  */
 export async function deleteMessage(chatId: string, messageId: string): Promise<void> {
+  // The flag expires per BUG-10's window, but scrubbing the payload never does:
+  // null writes skip .validate and the text/media rules exempt them, so an old
+  // message is still wiped, just no longer flaggable after ~2 days.
   await update(Paths.message(chatId, messageId), {
     deleted: true,
     text: null,
@@ -749,12 +794,26 @@ export async function deleteMessagesForEveryone(
   }
 }
 
+/** Last toggle ms per chat:message:uid, backing the BUG-27 throttle below. */
+const reactionToggles = new Map<string, number>();
+
 export async function toggleReaction(
   chatId: string,
   messageId: string,
   uid: string,
   emoji: string
 ): Promise<void> {
+  // BUG-27: per-key toggle throttle. Reaction count cannot be capped in rules
+  // (the language has no child counter, and distinct reactors are already
+  // bounded by group membership), so the remaining abuse is one client
+  // rage-toggling — a read plus a write per tap, each fanning a push to the
+  // author. Taps inside the window are almost always double-tap accidents.
+  const key = `${chatId}:${messageId}:${uid}`;
+  const now = serverNow();
+  const last = reactionToggles.get(key) ?? 0;
+  if (now - last < 1000) return;
+  reactionToggles.set(key, now);
+
   const path = Paths.reaction(chatId, messageId, uid);
   const current = await readOnce<string>(path);
   // Tapping the same emoji twice removes it.
@@ -787,13 +846,29 @@ export async function markSeen(
   await fanOut(updates).catch((e) => console.warn('[Flyer/chat] markSeen failed', e));
 }
 
+/**
+ * N-02: records that a message reached this device. Unlike `markSeen` this is
+ * legitimate to write without the user looking at anything — it fires from the
+ * push handler — and unlike `markSeen` it must NOT clear unread or consult
+ * read-receipt privacy: "delivered" is a transport fact, not a reading one.
+ */
+export async function markDelivered(
+  chatId: string,
+  messageId: string,
+  uid: string
+): Promise<void> {
+  await write(Paths.deliveredTo(chatId, messageId, uid), serverTimestamp()).catch(() => {});
+}
+
 // --- typing --------------------------------------------------------------
 
 const typingTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 export function setTyping(chatId: string, uid: string): void {
   const key = `${chatId}:${uid}`;
-  write(Paths.typingUser(chatId, uid), Date.now()).catch(() => {});
+  // BUG-32: server time, not wall clock — the peer judges this value against
+  // their own clock, so both sides must mean the same thing by "now".
+  write(Paths.typingUser(chatId, uid), serverNow()).catch(() => {});
 
   /**
    * The server clears the flag if this client dies.
@@ -850,14 +925,17 @@ export async function toggleStar(
   chatId: string,
   messageId: string
 ): Promise<boolean> {
+  // Transaction, not read-then-write: two devices toggling at once both read
+  // null (or both read set) and one toggle is silently lost.
+  // Transaction, not read-then-write: two devices toggling at once both read
+  // null (or both read set) and one toggle is silently lost. The timestamp is
+  // a plain number rather than a server value — updaters must stay side-effect
+  // free and re-runnable, and it is only a sort key anyway.
   const path = Paths.starredItem(uid, chatId, messageId);
-  const existing = await readOnce(path);
-  if (existing) {
-    await remove(path);
-    return false;
-  }
-  await write(path, { chatId, messageId, starredAt: serverTimestamp() });
-  return true;
+  const result = await ref(path).transaction((current: unknown) =>
+    current ? null : { chatId, messageId, starredAt: serverNow() }
+  );
+  return Boolean(result.snapshot.val());
 }
 
 export function listenToStarred(uid: string, cb: (items: StarredRef[]) => void): Unsubscribe {
@@ -879,6 +957,37 @@ export async function forwardMessage(
 ): Promise<void> {
   const chatId = await ensureChat(myUid, targetPeerUid);
   const messageId = pushKey(Paths.messages(chatId));
+
+  // Unlike sendText/sendMedia this had no offline branch: an offline forward
+  // relied on the RTDB SDK's in-memory buffer, so killing the app before
+  // reconnect silently lost it.
+  if (appState.get().networkStatus === 'offline') {
+    await enqueue({
+      id: messageId,
+      chatId,
+      draft: {
+        senderId: myUid,
+        type: message.type,
+        text: message.text,
+        mediaUrl: message.mediaUrl,
+        thumbUrl: message.thumbUrl,
+        width: message.width,
+        height: message.height,
+        durationMs: message.durationMs,
+        edited: false,
+        deleted: false,
+        reactions: {},
+        hiddenFor: {},
+        replyTo: message.replyTo,
+        forwardedFrom: message.senderId,
+        event: null,
+      },
+      localUri: null,
+      attempts: 0,
+      queuedAt: serverNow(),
+    });
+    return;
+  }
 
   await commitMessage(
     {
@@ -930,8 +1039,9 @@ export async function setChatArchived(
 
 export function isChatMuted(chat: ChatSummary | undefined, uid: string): boolean {
   const until = chat?.mutedBy?.[uid] ?? 0;
-  // -1 is the sentinel for "mute forever".
-  return until === -1 || until > Date.now();
+  // -1 is the sentinel for "mute forever". Compared on the server clock like
+  // every other timestamp the app writes — the writers below stamp serverNow.
+  return until === -1 || until > serverNow();
 }
 
 /**
@@ -1016,6 +1126,9 @@ export async function reportUser(
 }
 
 export async function deleteChatForMe(chatId: string, uid: string): Promise<void> {
+  // BUG-30: queued offline sends would otherwise replay after reconnect,
+  // re-writing userChats/lastTimestamp and resurrecting the deleted chat.
+  await clearQueueForChat(chatId);
   await clearChat(chatId, uid);
   await remove(Paths.userChat(uid, chatId));
   appState.get().removeChat(chatId);

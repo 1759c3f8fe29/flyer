@@ -106,7 +106,10 @@ export function Composer({
       if (!myUid || editing) return;
       saveDraft(myUid, chatId, value);
     },
-    [myUid, chatId, editing]
+    // Boolean, not the object: `editing` is a fresh Message identity on every
+    // store update, and listing it churns every keystroke handler downstream.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [myUid, chatId, editing !== null]
   );
 
   /**
@@ -221,7 +224,7 @@ export function Composer({
     return (
       <View style={[styles.wrapper, { backgroundColor: theme.colors.surface }]}>
         <View style={[styles.recordBar, { backgroundColor: theme.colors.bgElevated }]}>
-          <Pressable onPress={cancelRecording} round={40} haptic>
+          <Pressable onPress={cancelRecording} round={40} haptic accessibilityLabel="Delete recording">
             <Icon name="trash" size={19} color={theme.colors.danger} />
           </Pressable>
 
@@ -241,6 +244,7 @@ export function Composer({
             onPress={() => stopRecording(true)}
             round={44}
             haptic
+            accessibilityLabel="Send voice note"
             style={{ backgroundColor: theme.colors.accent, borderRadius: 22 }}
           >
             <Icon name="send" size={18} color={theme.colors.accentText} />
@@ -283,6 +287,7 @@ export function Composer({
               }
             }}
             round={34}
+            accessibilityLabel={editing ? 'Cancel editing' : 'Cancel reply'}
           >
             <Icon name="close" size={16} color={theme.colors.textMuted} />
           </Pressable>
@@ -306,7 +311,11 @@ export function Composer({
 
       <View style={styles.inputRow}>
         <View style={[styles.inputPill, { backgroundColor: theme.colors.bgElevated }]}>
-          <Pressable onPress={() => setEmojiOpen((v) => !v)} round={36}>
+          <Pressable
+            onPress={() => setEmojiOpen((v) => !v)}
+            round={36}
+            accessibilityLabel={emojiOpen ? 'Hide emoji' : 'Show emoji'}
+          >
             <Icon
               name="emoji"
               size={21}
@@ -328,7 +337,11 @@ export function Composer({
           />
 
           {!editing ? (
-            <Pressable onPress={() => setAttachOpen(true)} round={36}>
+            <Pressable
+              onPress={() => setAttachOpen(true)}
+              round={36}
+              accessibilityLabel="Attach media"
+            >
               <Icon name="attach" size={22} color={theme.colors.textMuted} />
             </Pressable>
           ) : null}

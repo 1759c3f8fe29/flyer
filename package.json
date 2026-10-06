@@ -3,6 +3,10 @@
   "version": "1.0.0",
   "main": "index.js",
   "private": true,
+  "engines": {
+    "node": "20.18.0",
+    "npm": "10.8.2"
+  },
   "scripts": {
     "start": "expo start --dev-client",
     "android": "expo run:android",

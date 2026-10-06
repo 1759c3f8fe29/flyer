@@ -20,6 +20,13 @@ interface Props {
   nameOf?: (uid: string) => string;
   onPress: () => void;
   onLongPress: () => void;
+  /**
+   * Swipe-action equivalents for assistive tech. Pan gestures do not exist for
+   * VoiceOver/TalkBack users, so the wrapping swipe row injects its commit
+   * actions here, onto the element that already owns the row's label.
+   */
+  swipeActions?: { name: string; label: string }[];
+  onSwipeAction?: (event: { nativeEvent: { actionName: string } }) => void;
 }
 
 /** Today -> clock, this week -> weekday, older -> short date. */
@@ -48,6 +55,8 @@ function ChatListItemImpl({
   nameOf,
   onPress,
   onLongPress,
+  swipeActions,
+  onSwipeAction,
 }: Props) {
   const theme = useTheme();
   const typing = useAppStore(selectPeerTyping(chat.id, myUid));
@@ -94,6 +103,8 @@ function ChatListItemImpl({
       accessibilityLabel={`${chat.isGroup ? 'Group' : 'Chat with'} ${name}${
         hasUnread ? `, ${unread} unread` : ''
       }`}
+      accessibilityActions={swipeActions}
+      onAccessibilityAction={onSwipeAction}
       style={styles.row}
     >
       <Avatar
@@ -191,10 +202,22 @@ function ChatListItemImpl({
 }
 
 export const ChatListItem = memo(ChatListItemImpl, (prev, next) => {
+  // The group preview prefix ("Ana: hello") resolves through `nameOf`, whose
+  // identity churns whenever the user cache loads. Comparing the function
+  // would re-render every row on each profile fetch; comparing the resolved
+  // string re-renders only the rows whose sender actually got a name.
+  const prevPrefix = prev.chat.isGroup
+    ? (prev.nameOf?.(prev.chat.lastMessage?.senderId ?? '') ?? 'Unknown')
+    : '';
+  const nextPrefix = next.chat.isGroup
+    ? (next.nameOf?.(next.chat.lastMessage?.senderId ?? '') ?? 'Unknown')
+    : '';
   return (
+    prevPrefix === nextPrefix &&
     prev.chat.id === next.chat.id &&
     prev.chat.lastTimestamp === next.chat.lastTimestamp &&
     prev.chat.lastMessage?.text === next.chat.lastMessage?.text &&
+    prev.chat.lastMessage?.type === next.chat.lastMessage?.type &&
     prev.chat.lastMessage?.deleted === next.chat.lastMessage?.deleted &&
     prev.chat.lastMessage?.senderId === next.chat.lastMessage?.senderId &&
     prev.chat.unread?.[prev.myUid] === next.chat.unread?.[next.myUid] &&
@@ -234,7 +257,7 @@ const styles = StyleSheet.create({
   time: { fontSize: 12 },
   rightBottom: { flexDirection: 'row', alignItems: 'center', gap: 5, marginTop: 6, minHeight: 20 },
   muteIcon: { opacity: 0.9 },
-  pinIcon: { opacity: 0.9, transform: [{ rotate: '45deg' }] },
+  pinIcon: { opacity: 0.9 },
   badge: {
     minWidth: 20,
     height: 20,

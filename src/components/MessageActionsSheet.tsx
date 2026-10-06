@@ -1,5 +1,6 @@
 import React from 'react';
 import { Modal, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useTheme } from '@/src/theme/ThemeProvider';
 import type { Message } from '@/src/config/types';
 import { Icon, type IconName } from './Icon';
@@ -31,6 +32,7 @@ export function MessageActionsSheet({
   onClose,
 }: Props) {
   const theme = useTheme();
+  const insets = useSafeAreaInsets();
 
   return (
     <Modal
@@ -44,7 +46,7 @@ export function MessageActionsSheet({
         onPress={onClose}
       >
         <Pressable
-          style={[styles.sheet, { backgroundColor: theme.colors.bgElevated }]}
+          style={[styles.sheet, { backgroundColor: theme.colors.bgElevated, paddingBottom: insets.bottom + 16 }]}
           onPress={() => {}}
         >
           <View style={[styles.grabber, { backgroundColor: theme.colors.border }]} />
@@ -56,6 +58,8 @@ export function MessageActionsSheet({
                   key={emoji}
                   onPress={() => onReact(emoji)}
                   haptic
+                  accessibilityLabel={`React ${emoji}`}
+                  accessibilityState={{ selected: myReaction === emoji }}
                   style={[
                     styles.reactionButton,
                     myReaction === emoji
@@ -107,7 +111,6 @@ const styles = StyleSheet.create({
     borderTopLeftRadius: 20,
     borderTopRightRadius: 20,
     paddingTop: 8,
-    paddingBottom: 30,
     maxHeight: '72%',
   },
   grabber: {

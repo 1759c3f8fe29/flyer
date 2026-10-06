@@ -3,6 +3,7 @@ import messaging, {
 } from '@react-native-firebase/messaging';
 import { AppRegistry, Platform } from 'react-native';
 import * as CallKeep from './CallKeepService';
+import { serverTimestamp, write } from './FirebaseService';
 
 /**
  * BackgroundTaskManager
@@ -35,7 +36,15 @@ interface CallCancelPush {
   callId: string;
 }
 
-type KnownPush = CallPush | CallCancelPush | { kind: 'message' };
+interface MessagePush {
+  kind: 'message';
+  chatId: string;
+  messageId: string;
+  /** Recipient uid — the push is fanned out per user, so this names the owner. */
+  to?: string;
+}
+
+type KnownPush = CallPush | CallCancelPush | MessagePush;
 
 function parse(message: FirebaseMessagingTypes.RemoteMessage): KnownPush | null {
   const data = message.data;
@@ -88,10 +97,23 @@ function registerBackgroundHandler() {
           CallKeep.endCall(String(push.callId).toLowerCase(), 'missed');
           break;
 
-        case 'message':
-          // Message pushes carry a `notification` block, so the system tray draws
-          // them without our involvement. Nothing to do here.
+        case 'message': {
+          // N-02: the push itself is the delivery signal. WhatsApp's second
+          // tick means "their device has it", and it appears while the app is
+          // closed — before this, nothing distinguished "phone off" from "has
+          // not looked yet". The handler is async and Android holds the
+          // headless task until the promise settles, so the write lands before
+          // we return. (iOS only reaches here for a live-enough app, so iOS
+          // delivery marks stay best-effort until a service extension lands.)
+          const { chatId, messageId, to } = push;
+          if (chatId && messageId && to) {
+            await write(
+              `messages/${chatId}/${messageId}/deliveredTo/${to}`,
+              serverTimestamp()
+            ).catch(() => {});
+          }
           break;
+        }
       }
     } catch (e) {
       console.warn('[Flyer/bg] background message handler failed', e);

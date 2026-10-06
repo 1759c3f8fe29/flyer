@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { ActivityIndicator, Modal, StyleSheet, Text, View } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useTheme } from '@/src/theme/ThemeProvider';
 import {
   captureWithCamera,
@@ -21,6 +22,7 @@ interface Props {
  */
 export function AttachSheet({ visible, onClose, onPicked }: Props) {
   const theme = useTheme();
+  const insets = useSafeAreaInsets();
   const [busy, setBusy] = useState(false);
 
   const run = async (fn: () => Promise<PickedMedia[]>) => {
@@ -78,7 +80,13 @@ export function AttachSheet({ visible, onClose, onPicked }: Props) {
     <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
       <Pressable style={[styles.backdrop, { backgroundColor: theme.colors.overlay }]} onPress={onClose}>
         <Pressable
-          style={[styles.sheet, { backgroundColor: theme.colors.bgElevated }]}
+          style={[
+            styles.sheet,
+            {
+              backgroundColor: theme.colors.bgElevated,
+              paddingBottom: Math.max(insets.bottom, 18) + 16,
+            },
+          ]}
           onPress={() => {}}
         >
           <View style={[styles.grabber, { backgroundColor: theme.colors.border }]} />
@@ -121,7 +129,6 @@ const styles = StyleSheet.create({
     borderTopLeftRadius: 20,
     borderTopRightRadius: 20,
     paddingTop: 8,
-    paddingBottom: 34,
     paddingHorizontal: 16,
   },
   grabber: {

@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { AppState, BackHandler, StatusBar, StyleSheet, Text, View } from 'react-native';
 import { Stack, router } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -97,10 +97,16 @@ export default function CallScreen() {
   }, []);
 
   // CallManager clears the store ~1.2s after a call ends; that is what dismisses
-  // this screen. Guarding on `call` alone would also fire on the first frame of
-  // a cold mount, so the effect is the only place that navigates.
+  // this screen. The mount must not count: on a cold start (notification tap)
+  // the store hydrates after this screen, and popping on the first empty frame
+  // would dismiss a call that never appeared.
+  const hadCall = useRef(Boolean(call));
   useEffect(() => {
-    if (!call) router.back();
+    if (call) {
+      hadCall.current = true;
+      return;
+    }
+    if (hadCall.current) router.back();
   }, [call]);
 
   const state = call?.state;
@@ -336,7 +342,23 @@ export default function CallScreen() {
               <Text style={[styles.answerLabel, { color: surface.textMuted }]}>Accept</Text>
             </View>
           </View>
-        ) : isOver ? null : (
+        ) : isOver ? (
+          // The auto-clear usually pops this screen, but if it races the
+          // detach the user would sit on a dead "Call ended" view with
+          // swipe-back disabled and no way out. An explicit Close covers it.
+          <View style={[styles.controlBar, { paddingVertical: theme.spacing(3) }]}>
+            <Pressable
+              onPress={() => router.back()}
+              haptic
+              round={64}
+              accessibilityRole="button"
+              accessibilityLabel="Close call screen"
+              style={{ backgroundColor: BAR_BG }}
+            >
+              <Icon name="close" size={26} color={surface.text} />
+            </Pressable>
+          </View>
+        ) : (
           <View
             style={[
               styles.controlBar,

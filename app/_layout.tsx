@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { ActivityIndicator, StyleSheet, View } from 'react-native';
+import { ActivityIndicator, StyleSheet, Text, View } from 'react-native';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
@@ -23,8 +23,8 @@ import {
 } from '@/src/services/ChatEngine';
 import { listenToContacts, listenToRequests } from '@/src/services/ContactService';
 import { startOutbox, stopOutbox } from '@/src/services/OfflineQueue';
-import { hydrateSmartReply } from '@/src/services/SmartReplyService';
-import { Paths, onValue } from '@/src/services/FirebaseService';
+import { hydrateSmartReply, resetSmartReply } from '@/src/services/SmartReplyService';
+import { Paths, onValue, startServerClock } from '@/src/services/FirebaseService';
 import type { UserProfile } from '@/src/config/types';
 
 /**
@@ -73,6 +73,49 @@ function useAuthGate() {
   return redirecting;
 }
 
+/**
+ * H-02 (client half): without this a render crash anywhere below the root
+ * unmounts to a white screen with no recovery except a reinstall-grade restart.
+ * The boundary resets to a tappable fallback; crash *reporting* (Crashlytics)
+ * is still open and belongs with it, scrubbing message text before upload.
+ */
+class RootErrorBoundary extends React.Component<
+  { children: React.ReactNode },
+  { failed: boolean }
+> {
+  state = { failed: false };
+
+  static getDerivedStateFromError(): { failed: boolean } {
+    return { failed: true };
+  }
+
+  componentDidCatch(error: unknown): void {
+    console.warn('[Flyer] uncaught render error', error);
+  }
+
+  render(): React.ReactNode {
+    if (!this.state.failed) return this.props.children;
+    return (
+      <View style={boundaryStyles.fallback}>
+        <Text style={boundaryStyles.title}>Something went wrong</Text>
+        <Text style={boundaryStyles.body}>Restart the app to continue.</Text>
+      </View>
+    );
+  }
+}
+
+const boundaryStyles = StyleSheet.create({
+  fallback: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 36,
+    backgroundColor: '#0B141A',
+  },
+  title: { color: '#E9EDEF', fontSize: 17, fontWeight: '600', textAlign: 'center' },
+  body: { color: '#8696A0', fontSize: 14, marginTop: 8, textAlign: 'center' },
+});
+
 function RootNavigator() {
   const theme = useTheme();
   const authReady = useAppStore((s) => s.authReady);
@@ -99,7 +142,7 @@ function RootNavigator() {
     // Env validation and the outbox sender registration both happen at module
     // scope — env.ts logs missing config on import, and ChatEngine calls
     // registerSender when it is first imported (which the import above does).
-    void hydrateSmartReply();
+    // SmartReply hydrates per session below: consent is per account.
 
     let sessionTeardown: (() => void)[] = [];
     let activeUid: string | null = null;
@@ -115,11 +158,13 @@ function RootNavigator() {
       sessionTeardown = [];
 
       if (activeUid) {
-        stopPresence();
+        void stopPresence();
         stopOutbox();
         // Module-level timers in ChatEngine; without this a pending typing timer
         // fires under whoever signs in next.
         stopTypingTimers();
+        // AI consent is per account — the next session re-hydrates its own.
+        resetSmartReply();
         Notifications.stop();
         CallManager.detach();
       }
@@ -137,6 +182,8 @@ function RootNavigator() {
       if (activeUid === user.uid) return;
       teardownSession();
       activeUid = user.uid;
+
+      void hydrateSmartReply(user.uid);
 
       try {
         await Auth.upsertProfile(user);
@@ -158,6 +205,9 @@ function RootNavigator() {
       const offSelf = listenToUser(user.uid);
       const offContacts = listenToContacts(user.uid);
       const offRequests = listenToRequests(user.uid);
+      // BUG-29/32: device clocks skew, so every timestamp that leaves the
+      // device goes through the server-time offset this subscribes to.
+      const offClock = startServerClock();
 
       startPresence(user.uid);
       startOutbox(user.uid);
@@ -188,7 +238,7 @@ function RootNavigator() {
           void Notifications.start(user.uid);
         });
 
-      sessionTeardown = [offMe, offChats, offBlocks, offSelf, offContacts, offRequests];
+      sessionTeardown = [offMe, offChats, offBlocks, offSelf, offContacts, offRequests, offClock];
     });
 
     return () => {
@@ -227,7 +277,8 @@ function RootNavigator() {
   }
 
   return (
-    <View style={[styles.root, { backgroundColor: theme.colors.bg }]}>
+    <RootErrorBoundary>
+      <View style={[styles.root, { backgroundColor: theme.colors.bg }]}>
       <StatusBar style={theme.dark ? 'light' : 'dark'} />
 
       <Stack
@@ -275,7 +326,8 @@ function RootNavigator() {
       <NetworkBanner />
       <CallOverlay />
       <Banner banner={banner} onPress={openBanner} onDismiss={() => setBanner(null)} />
-    </View>
+      </View>
+    </RootErrorBoundary>
   );
 }
 

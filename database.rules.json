@@ -59,6 +59,10 @@
           "showPhoto": { ".validate": "newData.isBoolean()" },
           "showAbout": { ".validate": "newData.isBoolean()" },
           "readReceipts": { ".validate": "newData.isBoolean()" },
+          // N-10: lock-screen preview control. Optional rather than required —
+          // hasChildren above still lists only the original four — so clients
+          // from before this flag keep writing privacy successfully.
+          "hidePreview": { ".validate": "newData.isBoolean()" },
           "$other": { ".validate": false }
         },
         "$other": { ".validate": false }
@@ -214,35 +218,59 @@
             ".validate": "newData.isString() && newData.val() === auth.uid"
           },
           "type": {
+            // BUG-26: sender-pinned, like every other mutable leaf. Without a
+            // leaf rule the denial of a post-create flip was incidental — the
+            // parent create rule just happened not to fire on updates — and any
+            // future leaf rule added here for another reason would silently open
+            // it. (Creation still flows through the parent .write above, which
+            // cascades down; this only governs later updates.)
+            ".write": "auth != null && data.parent().child('senderId').val() === auth.uid",
             ".validate": "newData.isString() && newData.val().matches(/^(text|image|video|audio|system)$/)"
           },
           "timestamp": {
             ".validate": "newData.isNumber() && newData.val() === now"
           },
 
+          // BUG-10: edits and delete-for-everyone expire. WhatsApp caps edits at
+          // 15 minutes (EDIT_WINDOW_MS) and delete-for-everyone at ~2 days
+          // (DELETE_WINDOW_MS) — both exported from ChatEngine.ts, which hides
+          // the actions past the same thresholds. Keep the literals in step:
+          // drift makes the client offer what the server denies, or vice versa. The clock is the
+          // message's own server-stamped `timestamp`, not the writer's device.
+          // (Creation flows through the parent .write, which cascades — these
+          // clauses only bite on later updates, where the parent is silent.)
+          // Clearing a leaf (writing null) is always allowed: nulls skip
+          // .validate by engine design, so this cannot smuggle content in — and
+          // delete-for-everyone must be able to scrub the payload of an old
+          // message even after its edit window has closed.
           "text": {
-            ".write": "auth != null && data.parent().child('senderId').val() === auth.uid",
+            ".write": "auth != null && data.parent().child('senderId').val() === auth.uid && (!newData.exists() || data.parent().child('timestamp').val() > now - 900000)",
             ".validate": "newData.isString() && newData.val().length <= 4096"
           },
           "edited": {
-            ".write": "auth != null && data.parent().child('senderId').val() === auth.uid",
+            ".write": "auth != null && data.parent().child('senderId').val() === auth.uid && data.parent().child('timestamp').val() > now - 900000",
             ".validate": "newData.isBoolean()"
           },
           "deleted": {
-            ".write": "auth != null && data.parent().child('senderId').val() === auth.uid",
+            ".write": "auth != null && data.parent().child('senderId').val() === auth.uid && data.parent().child('timestamp').val() > now - 172800000",
             ".validate": "newData.isBoolean()"
           },
+          // BUG-25: bubbles used to point at any URL on the internet — a
+          // participant could make your chat render their image host, logging
+          // IPs per view. Uploads go through Cloudinary exclusively, so the
+          // delivery host is pinned. (Nulls skip .validate by engine design, so
+          // text messages, which store null here, are unaffected.)
           "mediaUrl": {
-            ".write": "auth != null && data.parent().child('senderId').val() === auth.uid",
-            ".validate": "newData.isString() && newData.val().length <= 2048"
+            ".write": "auth != null && data.parent().child('senderId').val() === auth.uid && (!newData.exists() || data.parent().child('timestamp').val() > now - 900000)",
+            ".validate": "newData.isString() && newData.val().length <= 2048 && newData.val().matches(/^https:\\/\\/res\\.cloudinary\\.com\\/.+$/)"
           },
           "thumbUrl": {
-            ".write": "auth != null && data.parent().child('senderId').val() === auth.uid",
-            ".validate": "newData.isString() && newData.val().length <= 2048"
+            ".write": "auth != null && data.parent().child('senderId').val() === auth.uid && (!newData.exists() || data.parent().child('timestamp').val() > now - 900000)",
+            ".validate": "newData.isString() && newData.val().length <= 2048 && newData.val().matches(/^https:\\/\\/res\\.cloudinary\\.com\\/.+$/)"
           },
-          "width": { ".validate": "newData.isNumber() && newData.val() > 0" },
-          "height": { ".validate": "newData.isNumber() && newData.val() > 0" },
-          "durationMs": { ".validate": "newData.isNumber() && newData.val() >= 0" },
+          "width": { ".validate": "newData.isNumber() && newData.val() > 0 && newData.val() <= 8192" },
+          "height": { ".validate": "newData.isNumber() && newData.val() > 0 && newData.val() <= 8192" },
+          "durationMs": { ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 7200000" },
           "forwardedFrom": { ".validate": "newData.isString() && newData.val().length <= 128" },
 
           "event": {
@@ -270,6 +298,17 @@
           },
 
           "seenBy": {
+            "$uid": {
+              ".write": "auth != null && auth.uid === $uid && root.child('chats').child($chatId).child('participants').child(auth.uid).exists()",
+              ".validate": "newData.isNumber() && newData.val() > 0 && $uid === auth.uid"
+            }
+          },
+
+          // N-02: the "delivered" half of the ticks. Same shape and same rule
+          // as `seenBy` — each uid may only write its own key — because it is
+          // the same trust story: a receipt about your own device. Written by
+          // the background push handler, not when the user looks at anything.
+          "deliveredTo": {
             "$uid": {
               ".write": "auth != null && auth.uid === $uid && root.child('chats').child($chatId).child('participants').child(auth.uid).exists()",
               ".validate": "newData.isNumber() && newData.val() > 0 && $uid === auth.uid"
@@ -355,6 +394,24 @@
       }
     },
 
+    "memberSince": {
+      // BUG-14: join order for admin promotion. `participants/` values are
+      // pinned to boolean `true` by their own rule, so seniority cannot live
+      // there without migrating every existing group; this sibling records it
+      // for members added after it shipped instead. Writers mirror the
+      // participants rule — an admin seeding or removing, or a member leaving —
+      // and readers are the participants, who are the only ones promoting.
+      // Groups that predate this node have no entries and fall back to key
+      // order, which is exactly the old behaviour.
+      "$chatId": {
+        ".read": "auth != null && root.child('chats').child($chatId).child('participants').child(auth.uid).exists()",
+        "$uid": {
+          ".write": "auth != null && (root.child('chats').child($chatId).child('admins').child(auth.uid).val() === true || (auth.uid === $uid && !newData.exists()))",
+          ".validate": "newData.isNumber() && newData.val() > 0"
+        }
+      }
+    },
+
     "reports": {
       ".read": false,
       ".write": false,
@@ -375,7 +432,12 @@
       ".indexOn": ["state"],
       "$callId": {
         ".read": "auth != null && (data.child('callerId').val() === auth.uid || data.child('calleeId').val() === auth.uid)",
-        ".write": "auth != null && !data.exists() && newData.exists() && newData.child('callerId').val() === auth.uid && newData.child('calleeId').val() !== auth.uid && !newData.hasChild('answer') && !newData.hasChild('candidates')",
+        // BUG-37: a block must stop a call the same way it stops a message. The
+        // push half was already guarded in sendCallInvite, but the client writes
+        // this node and the incoming/ pointer directly, so an unguarded rule let
+        // a blocked caller ring anyway. blockPairs is keyed by the sorted 1:1
+        // chat id, so exactly one of the two joins can exist.
+        ".write": "auth != null && !data.exists() && newData.exists() && newData.child('callerId').val() === auth.uid && newData.child('calleeId').val() !== auth.uid && !newData.hasChild('answer') && !newData.hasChild('candidates') && !root.child('blockPairs').child(auth.uid + '_' + newData.child('calleeId').val()).hasChildren() && !root.child('blockPairs').child(newData.child('calleeId').val() + '_' + auth.uid).hasChildren()",
         ".validate": "newData.hasChildren(['callerId', 'calleeId', 'type', 'state', 'createdAt'])",
 
         "callerId": {
@@ -445,7 +507,10 @@
       "$uid": {
         ".read": "auth != null && auth.uid === $uid",
         "$callId": {
-          ".write": "auth != null && (auth.uid === $uid || (!data.exists() && newData.exists() && newData.child('callerId').val() === auth.uid && newData.child('callId').val() === $callId))",
+          // BUG-37: same enforcement as calls/ above, on the ring pointer the
+          // callee's client listens on. The callee's own writes (clearing the
+          // pointer) stay unguarded; only the caller's create is block-checked.
+          ".write": "auth != null && (auth.uid === $uid || (!data.exists() && newData.exists() && newData.child('callerId').val() === auth.uid && newData.child('callId').val() === $callId && !root.child('blockPairs').child(auth.uid + '_' + $uid).hasChildren() && !root.child('blockPairs').child($uid + '_' + auth.uid).hasChildren()))",
           ".validate": "newData.hasChildren(['callId', 'callerId', 'type', 'createdAt'])",
           "callId": { ".validate": "newData.isString() && newData.val() === $callId" },
           "callerId": { ".validate": "newData.isString() && newData.val().length <= 128 && newData.val() !== $uid" },

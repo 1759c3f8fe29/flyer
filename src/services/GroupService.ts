@@ -20,6 +20,7 @@ import {
   type Unsubscribe,
 } from './FirebaseService';
 import { appState } from './StateManager';
+import { clearQueueForChat } from './OfflineQueue';
 import { previewFor } from './ChatEngine';
 
 /**
@@ -84,6 +85,7 @@ async function writeSystemMessage(
       durationMs: null,
       timestamp: serverTimestamp(),
       seenBy: {},
+      deliveredTo: {},
       edited: false,
       deleted: false,
       reactions: {},
@@ -122,8 +124,39 @@ async function seedMembers(chatId: string, uids: string[]): Promise<void> {
     updates[`${Paths.chat(chatId)}/participants/${uid}`] = true;
     updates[`${Paths.chat(chatId)}/unread/${uid}`] = 0;
     updates[Paths.userChat(uid, chatId)] = { lastTimestamp: serverTimestamp() };
+    // BUG-14: join order for admin promotion. This is the single funnel every
+    // group add flows through, so seniority is recorded exactly once per join.
+    updates[Paths.memberSince(chatId, uid)] = serverTimestamp();
   }
   await fanOut(updates);
+}
+
+/**
+ * Longest-standing remaining member, for admin promotion on leave.
+ *
+ * Reads `memberSince` rather than trusting key order: `Object.keys` is
+ * insertion order of the local snapshot, which is uid order after a cold
+ * start, not join order. Members who joined before the node existed have no
+ * entry and sort last, preserving the old behaviour for old groups.
+ */
+async function longestStanding(chatId: string, candidates: string[]): Promise<string> {
+  const fallback = candidates[0];
+  try {
+    const snap = await readOnce<Record<string, number>>(`memberSince/${chatId}`);
+    if (!snap) return fallback;
+    let best = fallback;
+    let bestAt = Number.POSITIVE_INFINITY;
+    for (const uid of candidates) {
+      const at = snap[uid];
+      if (typeof at === 'number' && at < bestAt) {
+        best = uid;
+        bestAt = at;
+      }
+    }
+    return best;
+  } catch {
+    return fallback;
+  }
 }
 
 /**
@@ -247,6 +280,7 @@ export async function removeMember(
     [`${Paths.chat(chatId)}/participants/${uid}`]: null,
     [`${Paths.chat(chatId)}/admins/${uid}`]: null,
     [`${Paths.chat(chatId)}/unread/${uid}`]: null,
+    [Paths.memberSince(chatId, uid)]: null,
     [Paths.userChat(uid, chatId)]: null,
   });
 }
@@ -271,10 +305,13 @@ export async function leaveGroup(chatId: string, uid: string): Promise<void> {
   const others = Object.keys(chat.participants ?? {}).filter((u) => u !== uid);
 
   if (others.length === 0) {
+    // BUG-30: same resurrection as deleteChatForMe — drop queued sends first.
+    await clearQueueForChat(chatId);
     await fanOut({
       [`${Paths.chat(chatId)}/participants/${uid}`]: null,
       [`${Paths.chat(chatId)}/admins/${uid}`]: null,
       [`${Paths.chat(chatId)}/unread/${uid}`]: null,
+      [Paths.memberSince(chatId, uid)]: null,
       [Paths.userChat(uid, chatId)]: null,
     });
     appState.get().removeChat(chatId);
@@ -289,12 +326,14 @@ export async function leaveGroup(chatId: string, uid: string): Promise<void> {
     [`${Paths.chat(chatId)}/participants/${uid}`]: null,
     [`${Paths.chat(chatId)}/admins/${uid}`]: null,
     [`${Paths.chat(chatId)}/unread/${uid}`]: null,
+    [Paths.memberSince(chatId, uid)]: null,
     [Paths.userChat(uid, chatId)]: null,
   };
   if (admins[uid] === true && remainingAdmins.length === 0) {
-    updates[`${Paths.chat(chatId)}/admins/${others[0]}`] = true;
+    updates[`${Paths.chat(chatId)}/admins/${await longestStanding(chatId, others)}`] = true;
   }
 
+  await clearQueueForChat(chatId);
   await fanOut(updates);
   appState.get().removeChat(chatId);
 }
@@ -360,6 +399,9 @@ export async function revokeAdmin(chatId: string, byUid: string, uid: string): P
   if (uid === chat!.createdBy) throw new Error('The group creator stays an admin');
 
   const admins = Object.keys(chat!.admins ?? {}).filter((u) => chat!.admins[u] === true);
+  // No-op first: revoking a non-admin in a single-admin group used to throw
+  // "needs at least one admin" for an operation that changes nothing.
+  if (!admins.includes(uid)) return;
   if (admins.length <= 1) throw new Error('A group needs at least one admin');
 
   await remove(`${Paths.chat(chatId)}/admins/${uid}`);

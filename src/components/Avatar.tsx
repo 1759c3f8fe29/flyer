@@ -1,7 +1,7 @@
 import React from 'react';
 import { StyleSheet, Text, View } from 'react-native';
 import { Image } from 'expo-image';
-import { avatarColor, initialsOf } from '@/src/theme/theme';
+import { avatarColor, avatarTextFor, initialsOf } from '@/src/theme/theme';
 import { useTheme } from '@/src/theme/ThemeProvider';
 import { thumbUrl } from '@/src/services/MediaManager';
 import { Icon } from './Icon';
@@ -32,6 +32,8 @@ export function Avatar({
 }: Props) {
   const theme = useTheme();
   const visible = showPhoto && uri;
+  const swatch = avatarColor(uid || name);
+  const onSwatch = avatarTextFor(swatch);
 
   // Google photo urls are already small; only Cloudinary uploads need resizing.
   const source = visible
@@ -40,12 +42,15 @@ export function Avatar({
       : uri
     : null;
 
+  // Decorative: every caller renders this next to the name it abbreviates, and
+  // the row itself carries the accessibility label — announcing the avatar too
+  // would read every name twice, plus an undescribed "online" dot.
   return (
-    <View style={{ width: size, height: size }}>
+    <View style={{ width: size, height: size }} accessible={false}>
       {source ? (
         <Image
           source={{ uri: source }}
-          style={[styles.image, { width: size, height: size, borderRadius: size / 2 }]}
+          style={[styles.image, { width: size, height: size, borderRadius: size / 2, backgroundColor: theme.colors.surfaceAlt }]}
           contentFit="cover"
           transition={150}
           cachePolicy="memory-disk"
@@ -58,14 +63,14 @@ export function Avatar({
               width: size,
               height: size,
               borderRadius: size / 2,
-              backgroundColor: avatarColor(uid || name),
+              backgroundColor: swatch,
             },
           ]}
         >
           {group ? (
-            <Icon name="people" size={size * 0.52} color="#FFFFFF" />
+            <Icon name="people" size={size * 0.52} color={onSwatch} />
           ) : (
-            <Text style={[styles.initials, { fontSize: size * 0.36 }]}>
+            <Text style={[styles.initials, { fontSize: size * 0.36, color: onSwatch }]}>
               {initialsOf(name)}
             </Text>
           )}
@@ -91,8 +96,8 @@ export function Avatar({
 }
 
 const styles = StyleSheet.create({
-  image: { backgroundColor: 'rgba(127,127,127,0.2)' },
+  image: {},
   fallback: { alignItems: 'center', justifyContent: 'center' },
-  initials: { color: '#FFFFFF', fontWeight: '600' },
+  initials: { fontWeight: '600' },
   dot: { position: 'absolute', right: 0, bottom: 0, borderWidth: 2 },
 });

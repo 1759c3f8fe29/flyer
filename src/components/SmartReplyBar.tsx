@@ -63,6 +63,9 @@ export function SmartReplyBar({ chatId, messages, myUid, onPick }: Props) {
           result
             .map((s) => s.trim())
             .filter((s) => s.length > 0)
+            // De-duplicated: duplicate strings would share a React key and the
+            // reconciler would drop or mis-wire a chip.
+            .filter((s, i, all) => all.indexOf(s) === i)
             .slice(0, MAX_SUGGESTIONS)
         );
       })
@@ -99,19 +102,19 @@ export function SmartReplyBar({ chatId, messages, myUid, onPick }: Props) {
           keyboardShouldPersistTaps="handled"
           contentContainerStyle={styles.chips}
         >
-          {suggestions.map((suggestion) => (
+          {suggestions.map((suggestion, index) => (
             <Pressable
-              key={suggestion}
+              key={`${index}:${suggestion}`}
               onPress={() => onPick(suggestion)}
               haptic
               accessibilityRole="button"
               accessibilityLabel={`Send suggested reply: ${suggestion}`}
               style={[styles.chip, { backgroundColor: theme.colors.accentDim }]}
             >
-              <Text
-                style={[styles.chipText, { color: theme.colors.accent }]}
-                numberOfLines={1}
-              >
+              {/* Full width, no truncation: the row scrolls horizontally, so a
+                  capped chip shows "Sounds gre…" while tapping it sends the
+                  whole sentence — the preview must be the payload. */}
+              <Text style={[styles.chipText, { color: theme.colors.accent }]}>
                 {suggestion}
               </Text>
             </Pressable>
@@ -187,7 +190,6 @@ const styles = StyleSheet.create({
     borderRadius: 999,
     paddingHorizontal: 14,
     paddingVertical: 8,
-    maxWidth: 240,
   },
   chipText: { fontSize: 14, fontWeight: '500' },
   placeholder: { height: 33 },

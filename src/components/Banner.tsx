@@ -10,6 +10,8 @@ export interface BannerPayload {
   senderId: string;
   title: string;
   body: string;
+  /** Distinguishes two identical texts from the same sender (see `key`). */
+  messageId?: string;
 }
 
 interface Props {
@@ -27,9 +29,12 @@ export function Banner({ banner, onPress, onDismiss }: Props) {
   const insets = useSafeAreaInsets();
   const translateY = useRef(new Animated.Value(HIDDEN_OFFSET)).current;
 
-  // Keyed on chatId + title + body so a second notification from the same chat
-  // re-arms the timer instead of inheriting the previous one's remaining time.
-  const key = banner ? `${banner.chatId}:${banner.title}:${banner.body}` : null;
+  // Keyed on identity, not content: two "ok" texts from the same sender used
+  // to share a key, so the second inherited the first toast's remaining timer
+  // and never re-animated.
+  const key = banner
+    ? `${banner.chatId}:${banner.senderId}:${banner.messageId ?? banner.title}:${banner.body}`
+    : null;
 
   /**
    * Always call the newest `onDismiss`, without letting its identity re-arm the

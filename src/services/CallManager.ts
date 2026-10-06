@@ -1,4 +1,3 @@
-import { Platform, Vibration } from 'react-native';
 import functions from '@react-native-firebase/functions';
 import type { MediaStream } from 'react-native-webrtc';
 import { Limits } from '@/src/config/env';
@@ -50,6 +49,8 @@ class CallManagerImpl {
   private callkeepUnsub: (() => void) | null = null;
   /** Set when we answered from the native UI before the RTC layer was ready. */
   private pendingNativeAnswer = false;
+  /** Which call that answer belongs to — a stale push must not arm the next one. */
+  private pendingNativeCallId: string | null = null;
 
   private onLocalStreamCb: ((s: MediaStream | null) => void) | null = null;
   private onRemoteStreamCb: ((s: MediaStream | null) => void) | null = null;
@@ -223,6 +224,14 @@ class CallManagerImpl {
     const myUid = this.myUid;
     if (!myUid) return;
 
+    // BUG-37: the message path consults the local block list before rendering;
+    // calls never did, so a blocked caller could still ring (the rules above
+    // are the enforcement, this keeps the UI from ever flashing the call).
+    if (appState.get().blocked[invite.callerId] === true) {
+      await remove(`${Paths.incoming(myUid)}/${invite.callId}`).catch(() => {});
+      return;
+    }
+
     // Busy: reject without disturbing the call in progress.
     if (this.callId && this.callId !== invite.callId) {
       await update(Paths.call(invite.callId), {
@@ -279,14 +288,22 @@ class CallManagerImpl {
       hasVideo: invite.type === 'video',
     });
 
-    if (Platform.OS === 'android') {
-      Vibration.vibrate([0, 500, 1000], true);
-    }
+    // N-09: no manual vibration. CallKeep runs with `selfManaged: false`, so
+    // the OS ConnectionService already rings with the system ringtone and its
+    // own vibration — buzzing here as well double-vibrates on one path (the
+    // RTDB pointer) but not the other (the FCM background handler), so the
+    // same call felt different depending on whether the app was alive.
 
-    // The native UI may have been answered before this ran (cold start).
-    if (this.pendingNativeAnswer) {
+    // The native UI may have been answered before this ran (cold start) — but
+    // only for the call that was actually answered. A bare boolean here once
+    // let a stale push auto-answer the next unrelated invite.
+    if (this.pendingNativeAnswer && this.pendingNativeCallId === invite.callId) {
       this.pendingNativeAnswer = false;
+      this.pendingNativeCallId = null;
       await this.accept();
+    } else {
+      this.pendingNativeAnswer = false;
+      this.pendingNativeCallId = null;
     }
   }
 
@@ -295,6 +312,7 @@ class CallManagerImpl {
     if (!this.callId) {
       // Woken by the push but the invite listener has not resolved yet.
       this.pendingNativeAnswer = true;
+      this.pendingNativeCallId = callId;
       return;
     }
     if (this.callId !== callId) return;
@@ -307,7 +325,6 @@ class CallManagerImpl {
     const active = appState.get().activeCall;
     if (!callId || !myUid || !active) return false;
 
-    Vibration.cancel();
     this.clearRingTimeout();
 
     const perms = await ensureCallPermissions(active.type === 'video');
@@ -350,7 +367,6 @@ class CallManagerImpl {
     const callId = this.callId;
     if (!callId) return;
 
-    Vibration.cancel();
     await update(Paths.call(callId), {
       state: 'rejected',
       endedAt: serverTimestamp(),
@@ -568,7 +584,6 @@ class CallManagerImpl {
   }
 
   private async cleanup(finalState: CallState) {
-    Vibration.cancel();
     this.clearRingTimeout();
 
     if (this.durationTimer) {
@@ -607,6 +622,7 @@ class CallManagerImpl {
     this.peerUid = null;
     this.isCaller = false;
     this.pendingNativeAnswer = false;
+    this.pendingNativeCallId = null;
 
     appState.get().setCallState(finalState);
     // Let the UI show "call ended" briefly before dismissing.
@@ -643,6 +659,16 @@ class CallManagerImpl {
     this.rtc = null;
     this.callId = null;
     this.myUid = null;
+    // Timers and the native-answer latch are session state too: without this a
+    // ring timeout fires under the next account, and a stale latch auto-answers
+    // whoever rings first after a re-login.
+    this.clearRingTimeout();
+    if (this.durationTimer) {
+      clearInterval(this.durationTimer);
+      this.durationTimer = null;
+    }
+    this.pendingNativeAnswer = false;
+    this.pendingNativeCallId = null;
     CallKeep.endAll();
   }
 

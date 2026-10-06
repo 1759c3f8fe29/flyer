@@ -5,7 +5,7 @@ import { useAppStore } from '@/src/services/StateManager';
 import { onListenerError } from '@/src/services/FirebaseService';
 
 const STRIP_HEIGHT = 26;
-/** White reads correctly on both the danger and warning fills, in either theme. */
+/** White reads on the danger fill; the warning fill takes dark `onWarning`. */
 const ON_FILL = 'rgba(255,255,255,0.95)';
 
 /**
@@ -68,7 +68,7 @@ export function NetworkBanner() {
     if (status === 'reconnecting') {
       return {
         background: theme.colors.warning,
-        color: ON_FILL,
+        color: theme.colors.onWarning,
         message: 'Connecting…',
       };
     }
@@ -77,7 +77,7 @@ export function NetworkBanner() {
     if (listenerFailed) {
       return {
         background: theme.colors.warning,
-        color: ON_FILL,
+        color: theme.colors.onWarning,
         message: 'Not up to date — restart Flyer to refresh',
       };
     }

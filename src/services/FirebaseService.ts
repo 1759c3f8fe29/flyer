@@ -119,6 +119,10 @@ export const Paths = {
     `messages/${chatId}/${messageId}/reactions/${uid}`,
   seenBy: (chatId: string, messageId: string, uid: string) =>
     `messages/${chatId}/${messageId}/seenBy/${uid}`,
+  deliveredTo: (chatId: string, messageId: string, uid: string) =>
+    `messages/${chatId}/${messageId}/deliveredTo/${uid}`,
+
+  memberSince: (chatId: string, uid: string) => `memberSince/${chatId}/${uid}`,
 
   typing: (chatId: string) => `typing/${chatId}`,
   typingUser: (chatId: string, uid: string) => `typing/${chatId}/${uid}`,
@@ -156,6 +160,7 @@ export const Paths = {
   sentRequest: (uid: string, toUid: string) => `sentRequests/${uid}/${toUid}`,
 
   connected: () => '.info/connected',
+  serverTimeOffset: () => '.info/serverTimeOffset',
 } as const;
 
 export const ref = (path: string): Ref => db.ref(path);
@@ -247,6 +252,29 @@ export function onValue(
     (err) => reportListenerError(label, 'value', err as Error, onError)
   );
   return () => r.off('value', handler);
+}
+
+/**
+ * Server clock (BUG-29, BUG-32).
+ *
+ * Optimistic rows and typing flags used to carry `Date.now()` — the device's
+ * wall clock, routinely minutes off. Messages then visibly jumped position on
+ * server ack, and a typing flag written by a fast-clocked device was judged by
+ * the peer's slower one, so "typing…" stuck or never appeared. `.info/serverTimeOffset`
+ * is the server's answer to "how wrong is this clock", maintained by the SDK.
+ * Reads go through `serverNow()` wherever a timestamp leaves the device.
+ */
+let clockOffsetMs = 0;
+
+export function startServerClock(): Unsubscribe {
+  return onValue(Paths.serverTimeOffset(), (snap) => {
+    const offset = Number(snap.val() ?? 0);
+    if (Number.isFinite(offset)) clockOffsetMs = offset;
+  });
+}
+
+export function serverNow(): number {
+  return Date.now() + clockOffsetMs;
 }
 
 export function onChildAdded(

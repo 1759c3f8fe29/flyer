@@ -35,19 +35,40 @@ export default function ArchivedScreen() {
   const chats = useArchivedChats();
   const users = useAppStore((s) => s.users);
 
+  /** Group previews prefix the sender's name; this resolves it from the cache. */
+  const nameOf = useCallback((uid: string) => users[uid]?.name ?? 'Unknown', [users]);
+
   const [menuFor, setMenuFor] = useState<ChatSummary | null>(null);
   const watched = useRef(new Map<string, () => void>());
+
+  // White label on this background in both themes (see the same pairing on the
+  // main list's swipe panels).
+  const unarchivePanel = theme.dark ? '#007A5E' : theme.colors.accent;
 
   useEffect(() => {
     if (!myUid) return;
     const live = watched.current;
+    const wanted = new Set<string>();
     for (const chat of chats) {
       const uids = chat.isGroup
         ? Object.keys(chat.participants ?? {}).filter((uid) => uid !== myUid)
         : [peerOf(chat, myUid)];
       for (const uid of uids) {
-        if (uid && !live.has(uid)) live.set(uid, listenToUser(uid));
+        if (uid) wanted.add(uid);
       }
+    }
+    for (const [uid, off] of live) {
+      if (!wanted.has(uid)) {
+        try {
+          off();
+        } catch {
+          /* ignore */
+        }
+        live.delete(uid);
+      }
+    }
+    for (const uid of wanted) {
+      if (!live.has(uid)) live.set(uid, listenToUser(uid));
     }
   }, [chats, myUid]);
 
@@ -126,7 +147,7 @@ export default function ArchivedScreen() {
               right={{
                 icon: 'unarchive',
                 label: 'Unarchive',
-                color: theme.colors.accent,
+                color: unarchivePanel,
                 onTrigger: () => void unarchive(item),
               }}
             >
@@ -135,6 +156,7 @@ export default function ArchivedScreen() {
                 peer={peerUid ? (users[peerUid] ?? null) : null}
                 myUid={myUid}
                 muted={isChatMuted(item, myUid)}
+                nameOf={nameOf}
                 onPress={() => router.push(`/chat/${item.id}`)}
                 onLongPress={() => setMenuFor(item)}
               />
@@ -153,7 +175,11 @@ export default function ArchivedScreen() {
       <ActionSheet
         visible={menuFor !== null}
         title={
-          menuFor && myUid ? (users[peerOf(menuFor, myUid) ?? '']?.name ?? 'Chat') : ''
+          menuFor
+            ? menuFor.isGroup
+              ? (menuFor.name ?? 'Group')
+              : (users[peerOf(menuFor, myUid ?? '') ?? '']?.name ?? 'Chat')
+            : ''
         }
         actions={actions}
         onClose={() => setMenuFor(null)}

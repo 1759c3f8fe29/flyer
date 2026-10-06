@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { Alert, FlatList, StyleSheet, Text, View } from 'react-native';
+import { Alert, BackHandler, FlatList, StyleSheet, Text, View } from 'react-native';
 import { Stack, router } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useTheme } from '@/src/theme/ThemeProvider';
@@ -145,6 +145,17 @@ export default function CallsScreen() {
 
   const [entries, setEntries] = useState<CallHistoryEntry[]>([]);
   const [menuOpen, setMenuOpen] = useState(false);
+
+  // Hardware back dismisses the overflow menu rather than the tab — the chat
+  // screen's identical menu does this, and this one was missed.
+  useEffect(() => {
+    if (!menuOpen) return;
+    const sub = BackHandler.addEventListener('hardwareBackPress', () => {
+      setMenuOpen(false);
+      return true;
+    });
+    return () => sub.remove();
+  }, [menuOpen]);
 
   useEffect(() => {
     if (!myUid) return;

@@ -1,6 +1,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import NetInfo from '@react-native-community/netinfo';
 import type { QueuedSend } from '@/src/config/types';
+import { serverNow } from './FirebaseService';
 import { appState } from './StateManager';
 
 /**
@@ -96,10 +97,12 @@ export function startOutbox(uid: string) {
   netUnsub?.();
   netUnsub = NetInfo.addEventListener((state) => {
     if (state.isConnected && state.isInternetReachable !== false) {
-      void flush();
+      // Covered: NetInfo.fetch inside flush() rejects on some Android ROMs,
+      // and an unhandled rejection here is a crash report, not a retry.
+      void flush().catch(() => {});
     }
   });
-  void loadQueue().then(() => flush());
+  void loadQueue().then(() => flush().catch(() => {}));
 }
 
 /**
@@ -120,7 +123,7 @@ export async function enqueue(item: QueuedSend): Promise<void> {
   await loadQueue();
   queue.push(item);
   await persist();
-  void flush();
+  void flush().catch(() => {});
 }
 
 export async function dequeue(id: string): Promise<void> {
@@ -164,6 +167,11 @@ export async function flush(): Promise<void> {
       // would land it out of order.
       if (stalled.has(item.chatId)) continue;
 
+      // Backoff: a permanently-failing item (removed from the group, denied
+      // rule) used to retry on every NetInfo event and every enqueue with zero
+      // delay — hammering RTDB and re-uploading to Cloudinary in a tight loop.
+      if (item.nextRetryAt && item.nextRetryAt > serverNow()) continue;
+
       try {
         await sender(item);
         await dequeue(item.id);
@@ -186,11 +194,16 @@ export async function flush(): Promise<void> {
             chatId: item.chatId,
             timestamp: item.queuedAt,
             seenBy: {},
+            deliveredTo: {},
             pending: false,
             failed: true,
           });
         } else {
           stalled.add(item.chatId);
+          // Exponential backoff, capped at 15 minutes: 30s, 1m, 2m, 4m, 8m.
+          // Persisted with the item so a restart does not reset the delay.
+          item.nextRetryAt =
+            serverNow() + Math.min(30_000 * 2 ** (item.attempts - 1), 900_000);
           await persist();
         }
       }
@@ -201,7 +214,7 @@ export async function flush(): Promise<void> {
 }
 
 export async function retryFailed(id: string, item: QueuedSend): Promise<void> {
-  await enqueue({ ...item, id, attempts: 0, queuedAt: Date.now() });
+  await enqueue({ ...item, id, attempts: 0, queuedAt: serverNow() });
 }
 
 export async function clearQueueForChat(chatId: string): Promise<void> {

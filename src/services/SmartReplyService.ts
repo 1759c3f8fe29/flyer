@@ -21,7 +21,25 @@ import type { Message } from '@/src/config/types';
  * must never surface as an error in the chat.
  */
 
-const STORAGE_KEY = '@flyer/smartReply/enabled';
+const STORAGE_PREFIX = '@flyer/smartReply';
+const OVERRIDES_SUFFIX = 'perChat/v1';
+
+/**
+ * Whose preference is in memory. AI consent must not leak across accounts on a
+ * shared device: a global key would hand B the previous owner's opt-in and send
+ * B's messages to Mistral without asking. Keys are per-uid, and nothing is
+ * adopted from the pre-uid global key — its owner is unknowable, and the safe
+ * direction is off.
+ */
+let ownerUid: string | null = null;
+
+function storageKey(uid: string): string {
+  return `${STORAGE_PREFIX}/${uid}/enabled`;
+}
+
+function overridesKey(uid: string): string {
+  return `${STORAGE_PREFIX}/${uid}/${OVERRIDES_SUFFIX}`;
+}
 
 /**
  * Per-chat overrides, as one JSON map of `chatId -> boolean`.
@@ -33,9 +51,9 @@ const STORAGE_KEY = '@flyer/smartReply/enabled';
  * appear here; an absent entry means "follow the global setting", which keeps the
  * map small and lets the master switch stay meaningful.
  */
-const OVERRIDES_KEY = '@flyer/smartReply/perChat/v1';
 
-/** How much history the model gets. Enough for context, small enough to stay cheap. */
+/** How much history the model gets. Enough for context, small enough to stay cheap.
+ * Keep in step with SMART_REPLY_MAX_TURNS in functions/index.js. */
 const CONTEXT_MESSAGES = 10;
 const MAX_SUGGESTIONS = 3;
 
@@ -58,14 +76,17 @@ let overrides: Record<string, boolean> = {};
 const listeners = new Set<() => void>();
 
 /**
- * Reads the persisted toggle into memory. Called once at app start so that the
- * synchronous `isSmartReplyEnabled()` used during render is accurate; before
- * this resolves it reports `false`, which is the safe direction to be wrong in.
+ * Reads the persisted toggle into memory. Takes the session uid — consent is
+ * per account (see `ownerUid`) — and re-reads on account switch.
  */
-export async function hydrateSmartReply(): Promise<boolean> {
-  if (hydrated) return enabled;
+export async function hydrateSmartReply(uid: string): Promise<boolean> {
+  if (hydrated && ownerUid === uid) return enabled;
+  ownerUid = uid;
   try {
-    const [raw, rawOverrides] = await AsyncStorage.multiGet([STORAGE_KEY, OVERRIDES_KEY]);
+    const [raw, rawOverrides] = await AsyncStorage.multiGet([
+      storageKey(uid),
+      overridesKey(uid),
+    ]);
     enabled = raw[1] === '1';
     overrides = parseOverrides(rawOverrides[1]);
   } catch (e) {
@@ -76,6 +97,14 @@ export async function hydrateSmartReply(): Promise<boolean> {
   hydrated = true;
   emit();
   return enabled;
+}
+
+/** Sign-out teardown: the next session must not inherit this one's consent. */
+export function resetSmartReply(): void {
+  ownerUid = null;
+  enabled = false;
+  hydrated = false;
+  overrides = {};
 }
 
 /**
@@ -108,8 +137,11 @@ export async function setSmartReplyEnabled(value: boolean): Promise<void> {
   enabled = value;
   hydrated = true;
   emit();
+  // Owner-less writes (before first hydrate) go nowhere rather than into a
+  // shared key: see `ownerUid`.
+  if (!ownerUid) return;
   try {
-    await AsyncStorage.setItem(STORAGE_KEY, value ? '1' : '0');
+    await AsyncStorage.setItem(storageKey(ownerUid), value ? '1' : '0');
   } catch (e) {
     // The switch already moved; losing the write only costs the preference on
     // next launch, and the default it falls back to is the private one.
@@ -183,8 +215,9 @@ export async function setChatOverride(chatId: string, value: boolean | null): Pr
 
   emit();
 
+  if (!ownerUid) return;
   try {
-    await AsyncStorage.setItem(OVERRIDES_KEY, JSON.stringify(overrides));
+    await AsyncStorage.setItem(overridesKey(ownerUid), JSON.stringify(overrides));
   } catch (e) {
     // Same reasoning as the global setting: the switch has already moved, and
     // losing the write only costs the preference on next launch.
@@ -225,6 +258,7 @@ function buildTranscript(messages: Message[], myUid: string) {
       }
       return {
         role: m.senderId === myUid ? ('me' as const) : ('them' as const),
+        // Mirrors SMART_REPLY_MAX_CHARS server-side; the server clamps anyway.
         content: content.slice(0, 500),
       };
     })

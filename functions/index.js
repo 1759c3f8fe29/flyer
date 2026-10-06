@@ -41,7 +41,9 @@ const CALL_PUSH_TTL_MS = 45 * 1000;
 /**
  * Server-side backstop for abandoned calls. Deliberately longer than the 45s
  * client ring timeout so a healthy client always wins the race and writes its
- * own, more accurate `endedReason`.
+ * own, more accurate `endedReason`. The schedule below runs every minute, so
+ * worst-case detection latency is ~2 minutes — the previous 5-minute cadence
+ * left the ring pointer up (and the missed-call push unsent) for ~6.
  */
 const STALE_CALL_MS = 60 * 1000;
 
@@ -59,6 +61,9 @@ const PREVIEW_MAX = 120;
  */
 const SEARCH_MIN_PREFIX = 3;
 const SEARCH_MAX_RESULTS = 20;
+// Paired with SEARCH_MIN_PREFIX in DirectoryService.ts: the client
+// short-circuits below it assuming the server would too. Change both or
+// queries render "no results" for searches that never ran.
 
 /**
  * Mistral API key for smart replies.
@@ -73,10 +78,13 @@ const SEARCH_MAX_RESULTS = 20;
  */
 const MISTRAL_API_KEY = defineSecret('MISTRAL_API_KEY');
 
-/** Chat turns accepted per smart-reply request. Matches the client's window. */
+/** Chat turns accepted per smart-reply request. Keep in step with the client's
+ * CONTEXT_MESSAGES (SmartReplyService.ts) — the server clamps independently,
+ * so drift turns one side into a silent truncator. */
 const SMART_REPLY_MAX_TURNS = 10;
 
-/** Per-turn character cap, enforced server-side so a client cannot inflate cost. */
+/** Per-turn character cap, enforced server-side so a client cannot inflate cost.
+ * Keep in step with the client's 500 in SmartReplyService.ts. */
 const SMART_REPLY_MAX_CHARS = 500;
 
 /** Mistral's small model: fast, cheap, and more than capable of a 3-word reply. */
@@ -93,14 +101,15 @@ const UPDATE_CHUNK = 500;
 
 /**
  * FCM error codes that mean "this token is dead, stop storing it".
- * `invalid-argument` is included because FCM returns it for structurally
- * corrupt tokens, but see the guard in sendToUser() — it is also what you get
- * back when the *message* is malformed.
+ * BUG-38: `invalid-argument` used to be here because FCM returns it for
+ * structurally corrupt tokens — but it is also what you get back when the
+ * *message* is malformed (e.g. the bad apns-priority/push-type combo below),
+ * so one bad deploy could prune live tokens. A payload error is not a token
+ * verdict; the wholeChunkInvalid guard only mitigates the all-tokens case.
  */
 const DEAD_TOKEN_CODES = new Set([
   'messaging/registration-token-not-registered',
   'messaging/invalid-registration-token',
-  'messaging/invalid-argument',
 ]);
 
 /* ------------------------------------------------------------------ *
@@ -170,7 +179,11 @@ async function sendToUser(uid, tokens, message) {
     });
   }
 
-  await pruneTokens(uid, dead);
+  await pruneTokens(uid, dead).catch((err) => {
+    // Sends already succeeded; a prune failure must not reject the caller and
+    // trigger a retry that delivers every push twice.
+    logger.warn('Token prune failed', { uid, error: err.message });
+  });
   return { sent, failed };
 }
 
@@ -198,9 +211,13 @@ function callPushEnvelope(data) {
     },
     apns: {
       headers: {
-        'apns-priority': '10',
+        // BUG-38: background pushes must be priority 5, not 10 — Apple rejects
+        // 10/background with 400 BadPriority, so no iOS device was woken.
+        'apns-priority': '5',
         'apns-push-type': 'background',
-        'apns-expiration': String(Math.floor(Date.now() / 1000) + CALL_PUSH_TTL_MS / 1000),
+        // Floored after the addition: flooring the seconds first and then adding
+        // a fractional TTL would send APNs "…90.5", which it rejects.
+        'apns-expiration': String(Math.floor((Date.now() + CALL_PUSH_TTL_MS) / 1000)),
       },
       payload: {
         aps: { 'content-available': 1 },
@@ -360,6 +377,21 @@ exports.onMessageWritten = onValueCreated('/messages/{chatId}/{messageId}', asyn
   const now = Date.now();
   const mutedBy = chat.mutedBy || {};
 
+  // BUG-28: the preview is server-maintained, not client-claimed. Any
+  // participant could previously rewrite `lastMessage` to arbitrary text, so
+  // the function re-asserts it from the message that just landed (admin SDK,
+  // bypassing rules). The client still writes it optimistically for latency;
+  // this is the authoritative overwrite milliseconds later.
+  await db.ref(`chats/${chatId}`).update({
+    lastMessage: {
+      text: typeof message.text === 'string' ? message.text : preview,
+      type: message.type,
+      senderId: message.senderId,
+      deleted: false,
+    },
+    lastTimestamp: now,
+  });
+
   // In a group the sender's name alone does not say which group it came from,
   // and someone in a dozen groups cannot tell them apart in the tray.
   const title = chat.isGroup && chat.name ? `${senderName} @ ${chat.name}` : senderName;
@@ -370,6 +402,10 @@ exports.onMessageWritten = onValueCreated('/messages/{chatId}/{messageId}', asyn
 
   await Promise.all(
     recipients.map(async (uid) => {
+      // One recipient's failure (token read, privacy read, prune) must not fail
+      // the whole fan-out: lastMessage above is already rewritten and earlier
+      // pushes already sent, so a throw here would retry and double-deliver.
+      try {
       // A negative value is the "mute forever" sentinel the client writes (see
       // isChatMuted in ChatEngine.ts). This used to be a bare `> now`, and since
       // -1 is not greater than now the push went out anyway: muting a chat
@@ -385,21 +421,40 @@ exports.onMessageWritten = onValueCreated('/messages/{chatId}/{messageId}', asyn
       if (blockSnap.val() === true) return;
       if (!tokens.length) return;
 
+      // N-10: lock-screen preview control. When the recipient hides previews
+      // the tray carries a bare notice; the chat itself is unchanged.
+      const hidePreview =
+        (await db.ref(`users/${uid}/privacy/hidePreview`).once('value')).val() === true;
+      // N-03: replacement is the behaviour, but a bare newest-only banner
+      // hides the other nine. The count is already in hand on the chat node.
+      const pending = Number((chat.unread || {})[uid] || 0) + 1;
+      const body =
+        hidePreview === true
+          ? 'New message'
+          : pending > 1
+            ? `${pending} new messages — latest: ${preview}`
+            : preview;
+
       // notification + data: the system tray renders this while the app is
       // backgrounded or killed, and the data block still reaches JS so tapping
-      // the notification can deep-link straight to the chat.
+      // the notification can deep-link straight to the chat. `to` names the
+      // recipient for the background delivered-receipt write (N-02).
       const { sent, failed } = await sendToUser(uid, tokens, {
-        notification: { title, body: preview },
+        notification: { title, body },
         data: {
           kind: 'message',
           chatId,
           messageId,
           senderId: message.senderId,
+          to: uid,
         },
         android: {
           priority: 'high',
           notification: {
-            channelId: 'messages',
+            // BUG-40: no `channelId: 'messages'` — the client creates no such
+            // channel, so naming it only selected FCM's fallback implicitly.
+            // Leaving it out makes the fallback explicit until real channels
+            // ship together with the mute UI.
             // One live notification per chat: a newer message replaces the older.
             tag: chatId,
           },
@@ -414,12 +469,18 @@ exports.onMessageWritten = onValueCreated('/messages/{chatId}/{messageId}', asyn
               // Groups every notification from this chat into one iOS thread.
               'thread-id': chatId,
               sound: 'default',
+              // N-05: conversation pushes break through Focus; without this a
+              // Sleep schedule holds them silently while WhatsApp wakes you.
+              'interruption-level': 'time-sensitive',
             },
           },
         },
       });
 
       if (failed) logger.warn('Message push partially failed', { chatId, uid, sent, failed });
+      } catch (err) {
+        logger.warn('Message push failed for recipient', { chatId, uid, error: err.message });
+      }
     })
   );
 });
@@ -497,7 +558,7 @@ exports.onReactionCreated = onValueCreated(
         // Normal, not high: a reaction is never worth waking a dozing device for.
         priority: 'normal',
         notification: {
-          channelId: 'messages',
+          // BUG-40: see onMessageWritten — no channelId until channels exist.
           // Deliberately a different tag from the chat's message notification.
           // Sharing one would let a reaction silently replace an unread message
           // in the tray.
@@ -506,7 +567,10 @@ exports.onReactionCreated = onValueCreated(
       },
       apns: {
         headers: { 'apns-priority': '5', 'apns-push-type': 'alert' },
-        payload: { aps: { 'thread-id': chatId, sound: 'default' } },
+        // N-05, same Focus breakthrough as message pushes.
+        payload: {
+          aps: { 'thread-id': chatId, sound: 'default', 'interruption-level': 'time-sensitive' },
+        },
       },
     });
 
@@ -569,6 +633,47 @@ exports.onCallStateChanged = onValueUpdated('/calls/{callId}/state', async (even
   });
 
   logger.info('Call history written', { callId, state: after, durationMs, missed });
+
+  // N-04: a missed call leaves no tray notification otherwise — the ring UI is
+  // gone and the history tab is in-app only, so a user who missed a call while
+  // locked has nothing on their lock screen. Declined and busy calls are the
+  // callee's own choice and stay silent, like WhatsApp. Reaped stale rings
+  // re-enter here with endedReason 'missed', which is exactly the case to buzz.
+  const endedReason = call.endedReason;
+  if (after === 'ended' && missed && endedReason !== 'rejected' && endedReason !== 'busy') {
+    const [blockSnap, calleeTokens] = await Promise.all([
+      db.ref(`blocks/${call.calleeId}/${call.callerId}`).once('value'),
+      readTokens(call.calleeId),
+    ]);
+    if (blockSnap.val() === true) return;
+    if (!calleeTokens.length) return;
+
+    // 1:1 chat id is the sorted uid join (mirrors chatIdFor in env.ts), so the
+    // tap lands in the existing conversation — or the start of one.
+    const pairId = [call.callerId, call.calleeId].sort().join('_');
+    const callerSnap = await db.ref(`users/${call.callerId}`).once('value');
+    const callerName = (callerSnap.val() || {}).name || 'Flyer user';
+    const callLabel = call.type === 'video' ? 'Missed video call' : 'Missed voice call';
+
+    await sendToUser(call.calleeId, calleeTokens, {
+      notification: { title: callerName, body: callLabel },
+      data: { kind: 'missed_call', chatId: pairId, callerId: call.callerId },
+      android: {
+        priority: 'high',
+        notification: { tag: `call:${pairId}` },
+      },
+      apns: {
+        headers: { 'apns-priority': '10', 'apns-push-type': 'alert' },
+        payload: {
+          aps: {
+            'thread-id': pairId,
+            sound: 'default',
+            'interruption-level': 'time-sensitive',
+          },
+        },
+      },
+    });
+  }
 });
 
 /* ------------------------------------------------------------------ *
@@ -611,7 +716,7 @@ async function reapCalls(db, now) {
   return applyInChunks(db, updates);
 }
 
-exports.reapStaleCalls = onSchedule('every 5 minutes', async () => {
+exports.reapStaleCalls = onSchedule('every 1 minutes', async () => {
   const db = getDatabase();
   const now = Date.now();
 
@@ -804,13 +909,15 @@ exports.searchUsers = onCall(async (request) => {
   if (!/^[a-z0-9_.]+$/.test(q)) return { results: [] };
 
   // \uf8ff sorts after any character a handle may contain, making this a prefix
-  // range rather than a scan of the whole index.
+  // range rather than a scan of the whole index. Over-fetched 2x on purpose:
+  // withoutBlockers below drops blocked and deleted accounts, and capping
+  // first would let those consume result slots and short-change valid matches.
   const claims = await db
     .ref('usernames')
     .orderByKey()
     .startAt(q)
     .endAt(`${q}\uf8ff`)
-    .limitToFirst(SEARCH_MAX_RESULTS)
+    .limitToFirst(SEARCH_MAX_RESULTS * 2)
     .once('value');
 
   const uids = [];
@@ -825,7 +932,7 @@ exports.searchUsers = onCall(async (request) => {
     .map((snap, i) => (snap.exists() ? searchProjection(uids[i], snap.val() || {}) : null))
     .filter(Boolean);
 
-  return { results: await withoutBlockers(db, uid, results) };
+  return { results: (await withoutBlockers(db, uid, results)).slice(0, SEARCH_MAX_RESULTS) };
 });
 
 /**

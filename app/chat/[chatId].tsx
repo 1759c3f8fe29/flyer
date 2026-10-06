@@ -43,9 +43,11 @@ import {
   buildMessageList,
   clearChat,
   clearTyping,
+  DELETE_WINDOW_MS,
   deleteMessage,
   deleteMessageForMe,
   dropQueued,
+  EDIT_WINDOW_MS,
   editMessage,
   isChatMuted,
   listenToBlockPair,
@@ -68,6 +70,7 @@ import {
   unblockUser,
   type ChatListItem,
 } from '@/src/services/ChatEngine';
+import { serverNow } from '@/src/services/FirebaseService';
 import { videoThumbnail } from '@/src/services/MediaManager';
 import { formatLastSeen } from '@/src/services/PresenceManager';
 import { CallManager } from '@/src/services/CallManager';
@@ -315,6 +318,9 @@ export default function ChatScreen() {
     setOlder([]);
     setReplyTo(null);
     setEditing(null);
+    // The unread divider belongs to the previous conversation; without this
+    // chat B inherits chat A's marker (or its latched absence).
+    setEntryUnread(null);
     exhaustedRef.current = false;
     loadingRef.current = false;
   }, [chatId]);
@@ -369,8 +375,11 @@ export default function ChatScreen() {
    * below the divider, not above a new one.
    */
   useEffect(() => {
-    if (entryUnread !== null || !myUid || liveMessages.length === 0) return;
-    setEntryUnread(chat?.unread?.[myUid] ?? 0);
+    // Gated on the chat row as well as the messages: on a cold start messages
+    // can arrive before the chat syncs, and latching `?? 0` then blocks the
+    // real count forever via the entryUnread !== null guard.
+    if (entryUnread !== null || !myUid || !chat || liveMessages.length === 0) return;
+    setEntryUnread(chat.unread?.[myUid] ?? 0);
   }, [entryUnread, myUid, chat, liveMessages.length]);
 
   // Receipts on focus and on every new arrival while the screen is open.
@@ -391,9 +400,9 @@ export default function ChatScreen() {
     loadingRef.current = true;
     setLoadingOlder(true);
     try {
-      const page = await loadOlderMessages(chatId, oldest.timestamp, myUid);
+      // Overlap removal lives in the service (BUG-17); the known set goes in.
       const known = new Set(messagesRef.current.map((m) => m.id));
-      const fresh = page.filter((m) => !known.has(m.id));
+      const fresh = await loadOlderMessages(chatId, oldest.timestamp, myUid, known);
 
       if (fresh.length === 0) {
         exhaustedRef.current = true;
@@ -430,7 +439,10 @@ export default function ChatScreen() {
     (e: NativeSyntheticEvent<NativeScrollEvent>) => {
       const offset = e.nativeEvent.contentOffset.y;
       const threshold = e.nativeEvent.layoutMeasurement.height * 0.8;
-      setScrolledUp(offset > threshold);
+      const up = offset > threshold;
+      // Fires every frame while scrolling; skip the state write when unchanged
+      // so the whole screen does not re-render mid-scroll.
+      setScrolledUp((prev) => (prev === up ? prev : up));
     },
     []
   );
@@ -542,6 +554,7 @@ export default function ChatScreen() {
 
       // Sequential: a parallel burst scrambles the order of the bubbles and
       // saturates the uplink, which makes every upload slower.
+      let failed = 0;
       for (let i = 0; i < picked.length; i += 1) {
         const item = picked[i];
         const thumbnailUri =
@@ -567,7 +580,17 @@ export default function ChatScreen() {
           );
         } catch (e) {
           console.warn('[Flyer/chat] media send failed', e);
+          // Offline failures are queued for retry with a pending bubble, so
+          // only an online failure — which leaves a failed bubble — alerts.
+          // Text and voice already do this; media used to vanish silently.
+          if (appState.get().networkStatus !== 'offline') failed += 1;
         }
+      }
+      if (failed > 0) {
+        alertError(
+          failed === 1 ? 'Media not sent' : `${failed} media not sent`,
+          'Check your connection — you can retry from the chat.'
+        );
       }
     },
     [chatId, myUid, peerUid, isGroup, replyTo, scrollToBottom]
@@ -659,6 +682,21 @@ export default function ChatScreen() {
     [chatId, myUid, peerUid, isGroup]
   );
 
+  // Stable row callbacks: fresh inline closures would defeat MessageBubble's
+  // memo on every parent render, re-rendering all 40 visible rows per keystroke.
+  const retryMessage = useCallback(
+    (message: Message) => {
+      void handleRetry(message);
+    },
+    [handleRetry]
+  );
+  const pressReply = useCallback(
+    (messageId: string) => {
+      void jumpToMessage(messageId);
+    },
+    [jumpToMessage]
+  );
+
   const handleSmartReply = useCallback(
     (suggestion: string) => {
       void handleSendText(suggestion);
@@ -711,6 +749,17 @@ export default function ChatScreen() {
     });
     return () => sub.remove();
   }, [selectionMode, clearSelection]);
+
+  // Same treatment for the overflow menu: back dismisses the menu rather than
+  // the chat. The tap-away Pressable covers touch, but hardware back skips it.
+  useEffect(() => {
+    if (!menuOpen) return;
+    const sub = BackHandler.addEventListener('hardwareBackPress', () => {
+      setMenuOpen(false);
+      return true;
+    });
+    return () => sub.remove();
+  }, [menuOpen]);
 
   /**
    * Long press opens the action sheet normally, and extends the selection once
@@ -866,15 +915,19 @@ export default function ChatScreen() {
     }
 
     if (mine && !message.deleted && !message.pending && message.type === 'text') {
-      list.push({
-        key: 'edit',
-        label: 'Edit',
-        icon: 'edit',
-        onPress: () => {
-          setReplyTo(null);
-          setEditing(message);
-        },
-      });
+      // BUG-10: the rules deny edits past 15 minutes, so offering it would
+      // only ever end in a permission error. Judged on the server clock.
+      if (serverNow() - message.timestamp <= EDIT_WINDOW_MS) {
+        list.push({
+          key: 'edit',
+          label: 'Edit',
+          icon: 'edit',
+          onPress: () => {
+            setReplyTo(null);
+            setEditing(message);
+          },
+        });
+      }
     }
 
     // "Delete for me" is offered on every message, including the peer's and
@@ -908,7 +961,14 @@ export default function ChatScreen() {
       });
     }
 
-    if (mine && !message.deleted && !message.pending) {
+    // BUG-10: delete-for-everyone expires after ~2 days (the rules deny it
+    // past that). An expired message keeps "Delete for me", like WhatsApp.
+    if (
+      mine &&
+      !message.deleted &&
+      !message.pending &&
+      serverNow() - message.timestamp <= DELETE_WINDOW_MS
+    ) {
       list.push({
         key: 'delete',
         label: 'Delete for everyone',
@@ -955,7 +1015,16 @@ export default function ChatScreen() {
     if (!chatId || !myUid || selectedMessages.length === 0) return;
 
     const count = selectedMessages.length;
-    const mine = selectedMessages.filter((m) => m.senderId === myUid && !m.deleted && !m.pending);
+    // BUG-10: expired messages can only go "for me" — the rules would deny an
+    // unsend past ~2 days, so they do not count toward the for-everyone offer.
+    const now = serverNow();
+    const mine = selectedMessages.filter(
+      (m) =>
+        m.senderId === myUid &&
+        !m.deleted &&
+        !m.pending &&
+        now - m.timestamp <= DELETE_WINDOW_MS
+    );
 
     /*
      * "Delete for everyone" is only offered when every selected message is one
@@ -1098,7 +1167,7 @@ export default function ChatScreen() {
       if (!chatId || !myUid) return;
       try {
         // -1 is the "forever" sentinel understood by isChatMuted.
-        await setChatMuted(chatId, myUid, ms === -1 ? -1 : Date.now() + ms);
+        await setChatMuted(chatId, myUid, ms === -1 ? -1 : serverNow() + ms);
       } catch (e) {
         console.warn('[Flyer/chat] mute failed', e);
         alertError('Could not update notifications', 'Please try again.');
@@ -1228,7 +1297,7 @@ export default function ChatScreen() {
     ({ item }: ListRenderItemInfo<ChatListItem>) => {
       if (item.kind === 'day') {
         return (
-          <View style={styles.dayRow}>
+          <View style={styles.dayRow} accessible accessibilityLabel={item.label}>
             <View
               style={[
                 styles.dayPill,
@@ -1244,16 +1313,17 @@ export default function ChatScreen() {
       }
 
       if (item.kind === 'unread') {
+        const unreadLabel = `${item.count} unread message${item.count !== 1 ? 's' : ''}`;
         return (
-          <View style={styles.dividerRow}>
+          <View style={styles.dividerRow} accessible accessibilityLabel={unreadLabel}>
             <View
               style={[
                 styles.dividerPill,
                 { backgroundColor: theme.colors.warning, borderColor: theme.colors.border },
               ]}
             >
-              <Text style={[styles.dividerLabel, { color: theme.colors.bg }]}>
-                {item.count} unread message{item.count !== 1 ? 's' : ''}
+              <Text style={[styles.dividerLabel, { color: theme.colors.onWarning }]}>
+                {unreadLabel}
               </Text>
             </View>
           </View>
@@ -1295,7 +1365,7 @@ export default function ChatScreen() {
                 },
               ]}
             >
-              {checked ? <Icon name="accept" size={13} color={theme.colors.accentText} /> : null}
+              {checked ? <Icon name="accept" size={15} color={theme.colors.accentText} /> : null}
             </Pressable>
           ) : null}
           <View style={styles.bubbleBody}>
@@ -1324,8 +1394,8 @@ export default function ChatScreen() {
               onPress={selectionMode ? onPressMessage : undefined}
               onPressMedia={openMedia}
               onReply={startReply}
-              onRetry={(message) => void handleRetry(message)}
-              onPressReply={(messageId) => void jumpToMessage(messageId)}
+              onRetry={retryMessage}
+              onPressReply={pressReply}
             />
           </View>
         </View>
@@ -1349,8 +1419,8 @@ export default function ChatScreen() {
       openActions,
       openMedia,
       startReply,
-      handleRetry,
-      jumpToMessage,
+      retryMessage,
+      pressReply,
     ]
   );
 
@@ -1409,10 +1479,10 @@ export default function ChatScreen() {
             accessibilityRole="button"
             accessibilityLabel="Cancel selection"
           >
-            <Icon name="close" size={26} color="#FFFFFF" />
+            <Icon name="close" size={26} color={theme.colors.headerText} />
           </Pressable>
 
-          <Text style={[styles.headerName, styles.selectionCount]} numberOfLines={1}>
+          <Text style={[styles.headerName, styles.selectionCount, { color: theme.colors.headerText }]} numberOfLines={1}>
             {selectedIds.size}
           </Text>
 
@@ -1424,7 +1494,7 @@ export default function ChatScreen() {
             accessibilityRole="button"
             accessibilityLabel={`Star ${selectedIds.size} messages`}
           >
-            <Icon name="star" size={20} color="#FFFFFF" />
+            <Icon name="star" size={20} color={theme.colors.headerText} />
           </Pressable>
 
           {selectedMessages.some((m) => Boolean(m.text) && !m.deleted) ? (
@@ -1434,7 +1504,7 @@ export default function ChatScreen() {
               accessibilityRole="button"
               accessibilityLabel="Copy selected messages"
             >
-              <Icon name="copy" size={19} color="#FFFFFF" />
+              <Icon name="copy" size={19} color={theme.colors.headerText} />
             </Pressable>
           ) : null}
 
@@ -1445,7 +1515,7 @@ export default function ChatScreen() {
               accessibilityRole="button"
               accessibilityLabel={`Forward ${selectedIds.size} messages`}
             >
-              <Icon name="forward" size={20} color="#FFFFFF" />
+              <Icon name="forward" size={20} color={theme.colors.headerText} />
             </Pressable>
           ) : null}
 
@@ -1455,7 +1525,7 @@ export default function ChatScreen() {
             accessibilityRole="button"
             accessibilityLabel={`Delete ${selectedIds.size} messages`}
           >
-            <Icon name="trash" size={20} color="#FFFFFF" />
+            <Icon name="trash" size={20} color={theme.colors.headerText} />
           </Pressable>
         </View>
       ) : (
@@ -1471,7 +1541,7 @@ export default function ChatScreen() {
             accessibilityRole="button"
             accessibilityLabel="Go back"
           >
-            <Icon name="back" size={30} color="#FFFFFF" />
+            <Icon name="back" size={30} color={theme.colors.headerText} />
           </Pressable>
 
           <Pressable
@@ -1490,13 +1560,14 @@ export default function ChatScreen() {
             />
 
             <View style={styles.identityText}>
-              <Text style={styles.headerName} numberOfLines={1}>
+              <Text style={[styles.headerName, { color: theme.colors.headerText }]} numberOfLines={1}>
                 {title}
               </Text>
               {presenceLine ? (
                 <Text
                   style={[
                     styles.headerPresence,
+                    { color: theme.colors.headerSubtext },
                     peerTyping ? styles.headerPresenceTyping : null,
                   ]}
                   numberOfLines={1}
@@ -1517,7 +1588,7 @@ export default function ChatScreen() {
                 accessibilityRole="button"
                 accessibilityLabel={`Video call ${peerName}`}
               >
-                <Icon name="video" size={20} color="#FFFFFF" />
+                <Icon name="video" size={20} color={theme.colors.headerText} />
               </Pressable>
 
               <Pressable
@@ -1526,7 +1597,7 @@ export default function ChatScreen() {
                 accessibilityRole="button"
                 accessibilityLabel={`Voice call ${peerName}`}
               >
-                <Icon name="phone" size={19} color="#FFFFFF" />
+                <Icon name="phone" size={19} color={theme.colors.headerText} />
               </Pressable>
             </>
           ) : null}
@@ -1537,7 +1608,7 @@ export default function ChatScreen() {
             accessibilityRole="button"
             accessibilityLabel="More options"
           >
-            <Icon name="more" size={22} color="#FFFFFF" />
+            <Icon name="more" size={22} color={theme.colors.headerText} />
           </Pressable>
         </View>
       )}
@@ -1863,10 +1934,12 @@ const styles = StyleSheet.create({
   },
   identity: { flex: 1, flexDirection: 'row', alignItems: 'center', gap: 9, paddingLeft: 2 },
   identityText: { flex: 1 },
-  headerName: { color: '#FFFFFF', fontSize: 17, fontWeight: '600' },
+  // Colour comes from the theme at each use site: the light header is white,
+  // so a hardcoded white title would vanish into it.
+  headerName: { fontSize: 17, fontWeight: '600' },
   /** Takes the space the identity block occupies in the normal header. */
   selectionCount: { flex: 1, marginLeft: 8, fontSize: 19 },
-  headerPresence: { color: 'rgba(255,255,255,0.78)', fontSize: 12, marginTop: 1 },
+  headerPresence: { fontSize: 12, marginTop: 1 },
   headerPresenceTyping: { fontStyle: 'italic' },
 
   menu: {
@@ -1949,9 +2022,9 @@ const styles = StyleSheet.create({
   bubbleRow: { flexDirection: 'row', alignItems: 'center' },
   bubbleBody: { flex: 1 },
   checkbox: {
-    width: 22,
-    height: 22,
-    borderRadius: 11,
+    width: 28,
+    height: 28,
+    borderRadius: 14,
     borderWidth: 2,
     marginLeft: 8,
     alignItems: 'center',

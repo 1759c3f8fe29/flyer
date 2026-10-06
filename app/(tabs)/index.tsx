@@ -30,6 +30,7 @@ import {
 } from '@/src/services/ChatEngine';
 import type { ChatSummary } from '@/src/config/types';
 import { ActionSheet, type SheetAction } from '@/src/components/ActionSheet';
+import { serverNow } from '@/src/services/FirebaseService';
 
 /** Mute duration offered by the long-press menu. */
 const MUTE_MS = 8 * 60 * 60 * 1000;
@@ -58,16 +59,33 @@ export default function ChatsScreen() {
     if (!myUid) return;
     const live = watched.current;
 
+    // Groups render every member's name in previews and bubbles, so all of
+    // them get watched, not just the single peer a 1:1 chat has.
+    const wanted = new Set<string>();
     for (const chat of chats) {
-      // Groups render every member's name in previews and bubbles, so all of
-      // them get watched, not just the single peer a 1:1 chat has.
       const uids = chat.isGroup
         ? Object.keys(chat.participants ?? {}).filter((uid) => uid !== myUid)
         : [peerOf(chat, myUid)];
-
       for (const uid of uids) {
-        if (uid && !live.has(uid)) live.set(uid, listenToUser(uid));
+        if (uid) wanted.add(uid);
       }
+    }
+
+    // Unsubscribe the departed: unfriended peers and ex-group-members used to
+    // stay watched until the tab unmounted, leaking a listener per change.
+    for (const [uid, off] of live) {
+      if (!wanted.has(uid)) {
+        try {
+          off();
+        } catch {
+          /* ignore */
+        }
+        live.delete(uid);
+      }
+    }
+
+    for (const uid of wanted) {
+      if (!live.has(uid)) live.set(uid, listenToUser(uid));
     }
   }, [chats, myUid]);
 
@@ -92,19 +110,26 @@ export default function ChatsScreen() {
   const onRefresh = useCallback(async () => {
     if (!myUid) return;
     setRefreshing(true);
-    // Re-attaching the peer listeners is what actually refreshes names, photos
-    // and presence; the chat list itself is already live.
-    for (const off of watched.current.values()) off();
-    watched.current.clear();
-    for (const chat of chats) {
-      const uids = chat.isGroup
-        ? Object.keys(chat.participants ?? {}).filter((uid) => uid !== myUid)
-        : [peerOf(chat, myUid)];
-      for (const uid of uids) {
-        if (uid && !watched.current.has(uid)) watched.current.set(uid, listenToUser(uid));
+    try {
+      // Re-attaching the peer listeners is what actually refreshes names, photos
+      // and presence; the chat list itself is already live.
+      for (const off of watched.current.values()) off();
+      watched.current.clear();
+      for (const chat of chats) {
+        const uids = chat.isGroup
+          ? Object.keys(chat.participants ?? {}).filter((uid) => uid !== myUid)
+          : [peerOf(chat, myUid)];
+        for (const uid of uids) {
+          if (uid && !watched.current.has(uid)) watched.current.set(uid, listenToUser(uid));
+        }
       }
+      // The re-attach above is synchronous, so without this the spinner clears
+      // in the same tick and refresh is a no-op animation. One beat lets it
+      // paint and gives slow listeners a head start.
+      await new Promise((resolve) => setTimeout(resolve, 600));
+    } finally {
+      setRefreshing(false);
     }
-    setRefreshing(false);
   }, [chats, myUid]);
 
   const closeSearch = useCallback(() => {
@@ -181,7 +206,7 @@ export default function ChatsScreen() {
         icon: muted ? 'unmute' : 'mute',
         onPress: async () => {
           try {
-            await setChatMuted(chatId, myUid, muted ? null : Date.now() + MUTE_MS);
+            await setChatMuted(chatId, myUid, muted ? null : serverNow() + MUTE_MS);
           } catch (e) {
             alertError('Could not update notifications', String(e));
           }
@@ -269,15 +294,22 @@ export default function ChatsScreen() {
 
   const noChatsAtAll = chats.length === 0;
 
+  // Swipe panels pair white labels with these backgrounds in both themes.
+  // Neither the accent nor textMuted survives that pairing in dark mode, so the
+  // dark variants are deliberately darker than their semantic cousins.
+  const pinPanel = theme.dark ? '#007A5E' : theme.colors.accent;
+  const archivePanel = theme.dark ? '#37474F' : '#54656F';
+
   return (
     <View style={[styles.root, { backgroundColor: theme.colors.bg, paddingTop: insets.top }]}>
-      <View style={[styles.header, { backgroundColor: theme.colors.header }]}>
+      <View style={[styles.header, { backgroundColor: theme.colors.header, borderBottomColor: theme.colors.border }]}>
         {searching ? (
           <SearchBar
             value={term}
             onChangeText={setTerm}
             onClose={closeSearch}
             placeholder="Search name or message"
+            autoFocus
           />
         ) : (
           <>
@@ -341,13 +373,13 @@ export default function ChatsScreen() {
               right={{
                 icon: item.pinned ? 'unpin' : 'pin',
                 label: item.pinned ? 'Unpin' : 'Pin',
-                color: theme.colors.accent,
+                color: pinPanel,
                 onTrigger: () => void togglePin(item),
               }}
               left={{
                 icon: 'archive',
                 label: 'Archive',
-                color: theme.colors.textMuted,
+                color: archivePanel,
                 onTrigger: () => void archive(item),
               }}
             >
@@ -378,7 +410,17 @@ export default function ChatsScreen() {
               actionLabel="Start a chat"
               onAction={() => router.push('/(tabs)/contacts')}
             />
-          ) : null
+          ) : (
+            // Not empty and not searching, yet nothing to show — every chat is
+            // archived. A blank list here used to read as a loading failure.
+            <EmptyState
+              icon="archive"
+              title="All chats archived"
+              body="Everything lives in Archived for now."
+              actionLabel="View archived"
+              onAction={() => router.push('/archived')}
+            />
+          )
         }
       />
 
@@ -426,6 +468,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingVertical: 10,
     minHeight: 56,
+    borderBottomWidth: StyleSheet.hairlineWidth,
   },
   title: { fontSize: 22, fontWeight: '700' },
   headerActions: { flexDirection: 'row', alignItems: 'center', gap: 4 },

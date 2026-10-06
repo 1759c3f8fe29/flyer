@@ -74,7 +74,7 @@ export function ListRow({
       {right ? <View style={styles.rightSlot}>{right}</View> : null}
 
       {showChevron && !right ? (
-        <Icon name="chevron" size={18} color={theme.colors.textFaint} style={styles.chevron} />
+        <Icon name="chevron" size={18} color={theme.colors.textMuted} style={styles.chevron} />
       ) : null}
     </View>
   );
@@ -82,7 +82,11 @@ export function ListRow({
   if (!interactive) return content;
 
   return (
-    <Pressable onPress={onPress} accessibilityRole="button">
+    <Pressable
+      onPress={onPress}
+      accessibilityRole="button"
+      accessibilityLabel={[title, value ?? subtitle].filter(Boolean).join(', ')}
+    >
       {content}
     </Pressable>
   );

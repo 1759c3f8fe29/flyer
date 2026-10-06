@@ -11,6 +11,9 @@ export interface Theme {
     surface: string;
     surfaceAlt: string;
     header: string;
+    /** Text and icons on `header`. The light header is white, so these are dark. */
+    headerText: string;
+    headerSubtext: string;
     border: string;
     text: string;
     textMuted: string;
@@ -26,6 +29,8 @@ export interface Theme {
     tickSeen: string;
     danger: string;
     warning: string;
+    /** Text on `warning`. Dark in both themes: white-on-amber fails contrast. */
+    onWarning: string;
     success: string;
     overlay: string;
     chatWallpaper: string;
@@ -61,6 +66,8 @@ export const lightTheme: Theme = {
     // White, not green: the light palette is white / light gray / green *accent*,
     // and `text` is near-black — on a green header that pairing fails contrast.
     header: '#FFFFFF',
+    headerText: '#0B141A',
+    headerSubtext: '#5E6B73',
     border: '#E4E6EA',
     text: '#0B141A',
     textMuted: '#5E6B73',
@@ -76,13 +83,16 @@ export const lightTheme: Theme = {
     tickSeen: '#34B7F1',
     danger: '#E23D3D',
     warning: '#E8A33D',
+    onWarning: '#0B141A',
     success: '#25D366',
     overlay: 'rgba(0,0,0,0.55)',
     chatWallpaper: '#EFE7DE',
     /** Background of a selected bubble during multi-select, ~15% accent. */
     chatSelection: 'rgba(0,128,105,0.12)',
     ripple: 'rgba(0,0,0,0.08)',
-    unreadBadge: '#25D366',
+    // Accent-darkened, not the brand green: white badge text on #25D366 is
+    // ~2.3:1, and the unread timestamp wears this on a white background too.
+    unreadBadge: '#008069',
   },
   spacing,
   radius,
@@ -97,6 +107,8 @@ export const darkTheme: Theme = {
     surface: '#111B21',
     surfaceAlt: '#202C33',
     header: '#1F2C33',
+    headerText: '#E9EDEF',
+    headerSubtext: '#8696A0',
     border: '#2A3942',
     text: '#E9EDEF',
     textMuted: '#8696A0',
@@ -112,6 +124,7 @@ export const darkTheme: Theme = {
     tickSeen: '#53BDEB',
     danger: '#F15C6D',
     warning: '#F0B232',
+    onWarning: '#0B141A',
     success: '#00A884',
     overlay: 'rgba(0,0,0,0.7)',
     chatWallpaper: '#0B141A',
@@ -142,6 +155,22 @@ export function avatarColor(seed: string): string {
     hash = (hash * 31 + seed.charCodeAt(i)) % 100000;
   }
   return AVATAR_COLORS[hash % AVATAR_COLORS.length];
+}
+
+/**
+ * Legible text on an avatar swatch. White initials on the light greens and
+ * ambers in AVATAR_COLORS fall below contrast, so pick per-swatch instead of
+ * hardcoding white at every call site.
+ */
+export function avatarTextFor(background: string): string {
+  const match = /^#([0-9a-fA-F]{6})$/.exec(background);
+  if (!match) return '#FFFFFF';
+  const n = parseInt(match[1], 16);
+  const r = (n >> 16) & 0xff;
+  const g = (n >> 8) & 0xff;
+  const b = n & 0xff;
+  const luminance = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+  return luminance > 0.55 ? '#0B141A' : '#FFFFFF';
 }
 
 export function initialsOf(name: string): string {
